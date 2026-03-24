@@ -301,6 +301,8 @@ OpenClaw supports separate development and production state directories, isolate
 
 > **PROD-owned files** — `MEMORY.md`, `memory/`, and `SYSTEM_LOG.md` live only in `~/.openclaw/workspace/`. The running agent writes to these; they are never overwritten by promotion. `CLAUDE.md` is the opposite: it exists only in `~/.openclaw-dev/workspace/` to guide Claude Code during development and is never promoted to production.
 
+> **LOCAL environment (optional):** For rapid iteration during initial development, you can symlink the DEV workspace to your git repo: `ln -sf /path/to/your/repo ~/.openclaw-dev/workspace`. Edits are immediately visible to the DEV gateway — no promote step needed. Do not use this for production.
+
 Instead of one monolithic prompt, distribute configuration across OpenClaw's purpose-built workspace files. Create all files in `~/.openclaw-dev/workspace/` — the dev workspace is the source of truth:
 
 **Before creating any files, collect these values. Every workspace file and skill references them:**
@@ -325,6 +327,8 @@ Instead of one monolithic prompt, distribute configuration across OpenClaw's pur
 | `[VERSION]` | OpenClaw version at deployment (from `openclaw --version`) | SYSTEM_LOG.md |
 
 > **If using Claude Code:** Give it all these values in a single prompt and let it create all workspace files and skills in one session. Example: `"Create all OpenClaw workspace files using these values: Agent Name = MyBot, Purpose = customer support, Operator = Jane, Timezone = America/Chicago, Data Sheet ID = 1abc..., Backup Repo = acme-corp/openclaw-backup"`. This ensures consistency across all files.
+
+> **Context injection order:** On every new session, OpenClaw loads workspace files into agent context in this order: `SOUL.md` → `AGENTS.md` → `TOOLS.md` → `USER.md` → `MEMORY.md` → daily memory files (today + yesterday) → matching skills. This order matters — earlier files set the security and behavioral foundation that later files build on. See `docs/references/reference-openclaw-design-patterns.md` for the full architecture reference.
 
 **3.1 — SOUL.md (Security Constitution + Core Purpose)**
 
@@ -1198,7 +1202,13 @@ Before creating skills, understand how OpenClaw processes them:
 
 - **Frontmatter fields:** `name` (routing key), `description` (routing text), `metadata.openclaw.emoji` (display icon), `metadata.openclaw.requires.bins` (binary dependency check — Gateway verifies these exist before enabling the skill).
 
-- **Skill body convention:** Follow a runbook format: **When to Use** (trigger conditions) → **Workflow** (step-by-step actions) → **Edge Cases** (what to do when things go wrong) → **Output** (expected response format). This structure gives the agent clear, unambiguous instructions. Vague skill instructions ("handle requests appropriately") fail; specific ones ("validate input, query sheet, format response, reply to sender") succeed.
+- **Skill body convention:** Follow a runbook format: **When to Use** (trigger conditions) → **Configuration** (external resources needed) → **Workflow** (step-by-step actions, starting with Step 0: Load Config) → **Edge Cases** (what to do when things go wrong) → **Rules / NEVER** (hard constraints) → **Output** (expected response format). This structure gives the agent clear, unambiguous instructions. Vague skill instructions ("handle requests appropriately") fail; specific ones ("validate input, query sheet, format response, reply to sender") succeed.
+
+- **Skill precedence (load order):** When skill names conflict: (1) `<workspace>/skills/` (highest — per-agent), (2) `~/.openclaw/skills/` (shared across agents), (3) bundled skills (lowest). Workspace skills always win.
+
+- **Idempotency guards:** Skills that process batches should check for "already processed" markers to prevent double-processing on re-runs. If a skill is triggered by cron and processes a queue, mark each item as processed before moving to the next.
+
+- **Operator summary as final step:** Every skill that mutates data should send a structured summary to the operator via a trusted channel (e.g., Telegram DM) as its last step. This is the primary observability mechanism.
 
 Below are two example skills demonstrating common patterns. Replace these with your own domain-specific skills.
 
@@ -1700,6 +1710,25 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - Review Google Sheets OAuth access: Google Account → Security → Third-party apps. Confirm the agent's project only has Sheets API scope. Revoke and reauthorize if scope has expanded. *(If you skipped Phase 2.5: skip this step.)*
 - Review DigitalOcean snapshots — confirm they're being created and prune old ones.
 - Test a full restore: spin up a new Droplet from a snapshot, verify the agent boots, connects to Google Sheets, and processes a test request. *(If you skipped Phase 2.5: omit Google Sheets from this test.)*
+
+**Cron Job Best Practices:**
+
+- **Use `sessionTarget: "isolated"` for cron jobs.** This prevents cron output from leaking to customer channels via the main session's channel context. System maintenance tasks (cleanup, health checks) can target the main session via `systemEvent` instead.
+- **Cron jobs are self-contained.** Each cron job runs in its own session context — it cannot see other sessions' conversation history. It must read all state from files or external sources.
+- **`sessions_send` from isolated cron (v2026.3.8+):** If isolated cron jobs need to delegate to the main session, two `openclaw.json` entries are required: `tools.subagents.tools.alsoAllow: ["sessions_send"]` (overrides the deny list) and `agents.defaults.sandbox.sessionToolsVisibility: "all"` (lets sandboxed sessions see `agent-main-main`). Without both, isolated cron jobs silently fail to delegate.
+- **Version-control cron snapshots.** Periodically snapshot cron jobs to `cron/jobs.json` in the workspace and track in git. This provides an audit trail and makes drift detection easy.
+- **Model routing for cost optimization.** Use cheaper models for mechanical cron jobs (template sends, data reads) and frontier models for complex reasoning. Per-cron override: `openclaw cron edit <id> --model <model>`.
+
+**Memory System Operations:**
+
+- Rebuild the full memory index: `openclaw memory index`
+- Check index health: `openclaw memory status`
+- Memory tools (`memory_search`, `memory_get`) must be in `tools.sandbox.tools.allow` in `openclaw.json` — the index auto-provisions but sandbox blocks tool use without explicit allow.
+- Bootstrap daily memory files via a midnight cron job (systemEvent on main session) to ensure the file exists before skills try to append to it.
+
+**Prompt Caching (Anthropic models):**
+
+For agents using Anthropic models with gaps >5 minutes between interactions, configure `cacheRetention: "long"` in `openclaw.json` to keep the system prompt cached. This can reduce system prompt token costs by ~80-90%. See `docs/references/reference-openclaw-prompt-caching.md` for the full configuration guide.
 
 **Skill Editing Workflow (when needs change):**
 

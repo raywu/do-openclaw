@@ -481,7 +481,17 @@ every: "1h"
 4. Run `openclaw memory status` — verify indexed file count > 0.
    If memory index is empty, alert:
    "Heartbeat Alert: Memory index empty — run `openclaw memory index` to rebuild."
-5. If any check fails, send an alert to operator Telegram:
+5. Verify today's daily memory file exists: `memory/YYYY-MM-DD.md`.
+   If missing, alert:
+   "Heartbeat Alert: Today's memory file missing — memory-init cron may have failed."
+6. Cron health audit: Read `cron/jobs.json` (if it exists).
+   For each job, check:
+   - Is the job enabled? Flag any disabled jobs that should be active.
+   - Does `consecutiveErrors` > 0? Flag jobs with recent errors.
+   - Does `lastRunStatus` indicate failure? Flag failed jobs.
+   If any anomalies found, send alert:
+   "Heartbeat Alert: Cron anomaly — [job name]: [issue description]"
+7. If any check fails, send an alert to operator Telegram:
    "Warning: Heartbeat Alert: [describe failure]"
 
 ## Do NOT
@@ -496,6 +506,16 @@ every: "1h"
 
 ---BEGIN BOOT.md---
 # BOOT.md
+
+## Context Injection Order
+On every new session, OpenClaw loads workspace files into agent context in this order:
+1. SOUL.md — identity, security boundaries, hard rules
+2. AGENTS.md — tool policies, confirmation gates, cron schedule
+3. TOOLS.md — prose instructions for available tools
+4. USER.md — operator context
+5. MEMORY.md — curated long-term facts
+6. memory/YYYY-MM-DD.md — today + yesterday daily logs
+7. Skills matching the current trigger/context
 
 ## Boot Sequence
 On session start:
@@ -616,7 +636,12 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
       "models": {
         "google/gemini-3-pro-preview": {},
         "google/gemini-2.5-pro": {},
-        "anthropic/claude-sonnet-4-5": {}
+        "anthropic/claude-sonnet-4-5": {},
+        "anthropic/claude-sonnet-4-6": {
+          "params": {
+            "cacheRetention": "long"
+          }
+        }
       },
       "workspace": "~/.openclaw/workspace",
       "compaction": {
@@ -634,6 +659,7 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
         "mode": "non-main",
         "workspaceAccess": "ro",
         "scope": "session",
+        "sessionToolsVisibility": "all",
         "docker": {
           "image": "openclaw-sandbox:bookworm-slim",
           "readOnlyRoot": true,
@@ -679,6 +705,11 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
           "memory_search", "memory_get"
         ],
         "deny": ["process", "cron", "gateway", "canvas", "nodes", "sessions_spawn", "browser"]
+      }
+    },
+    "subagents": {
+      "tools": {
+        "alsoAllow": ["sessions_send"]
       }
     }
   },
@@ -782,6 +813,18 @@ NOTE — Claude API key: OpenClaw uses Anthropic API keys (sk-ant-xxxxx from
 console.anthropic.com), not OAuth tokens from claude.ai subscriptions. Pro/Max/Team
 subscriptions cannot be used with third-party tools.
 
+NOTE — Prompt caching: The `cacheRetention: "long"` on the primary Anthropic model extends
+the prompt cache TTL beyond the default 5 minutes. This keeps the system prompt cached across
+typical 10-60 minute gaps between interactions, reducing system prompt token costs by ~80-90%.
+This is an Anthropic-only feature — silently ignored for Google/OpenAI models.
+
+NOTE — Isolated cron delegation (v2026.3.8+): Two config entries are required for isolated
+cron jobs to delegate work to the main session via `sessions_send`:
+  1. `tools.subagents.tools.alsoAllow: ["sessions_send"]` — overrides the v2026.3.8 deny list
+  2. `agents.defaults.sandbox.sessionToolsVisibility: "all"` — lets sandboxed sessions see agent-main-main
+Without BOTH entries, isolated cron delegation silently fails. If you are NOT using isolated
+cron jobs that need to delegate, you can omit these entries.
+
 Phase 3.8b — Create the DEV Gateway config:
 Copy openclaw.json and modify for development use:
    cp ~/.openclaw/openclaw.json ~/.openclaw-dev/openclaw.json
@@ -797,6 +840,14 @@ channels prevents DEV from accidentally responding to real users.
 Start DEV with: openclaw start --dev
 Stop when done testing.
 SSH tunnel for DEV dashboard: ssh -L 18790:localhost:18790 clawuser@[DROPLET_IP] → open http://localhost:18790.
+
+LOCAL Environment (Optional — for rapid iteration):
+Instead of editing files in ~/.openclaw-dev/workspace/ and promoting, you can symlink the
+DEV workspace to your git repo so edits are immediately visible to the DEV gateway:
+   rm -rf ~/.openclaw-dev/workspace
+   ln -sf [/path/to/your/workspace/repo] ~/.openclaw-dev/workspace
+This is useful during initial development but should NOT be used for production.
+🛑 HUMAN GATE: If you want LOCAL mode, confirm the path to your workspace git repo. Otherwise skip.
 
 ═══════════════════════════════════════════════════════════
 TASK 7: Build Sandbox Docker Image
@@ -976,6 +1027,25 @@ DigitalOcean Droplet (Ubuntu 24.04). The agent is configured for
 - **Messaging:** WhatsApp (user-facing), Telegram (operator alerts/reports)
 - **Backups:** Nightly git push to private GitHub repo via ~/scripts/daily_backup.sh
 
+## Context Injection Order
+On every new session, OpenClaw loads workspace files into agent context in this order:
+1. SOUL.md — identity, security boundaries, hard rules
+2. AGENTS.md — tool policies, confirmation gates, cron schedule
+3. TOOLS.md — prose instructions for available tools
+4. USER.md — operator context
+5. MEMORY.md — curated long-term facts
+6. memory/YYYY-MM-DD.md — today + yesterday daily logs
+7. Skills matching the current trigger/context
+
+## Design Patterns Reference
+See `docs/references/reference-openclaw-design-patterns.md` for:
+- Skill runbook pattern (When to Use → Configuration → Workflow → Edge Cases → Rules → Output)
+- Session & sandbox model (main vs. isolated, delegation pattern)
+- Cron job patterns (systemEvent vs. agentTurn, model routing, memory-tag-then-batch)
+- Memory architecture (MEMORY.md + daily logs + SQLite hybrid search)
+- Messaging patterns (channel trust tiers, DM policy modes)
+- Environment architecture (DEV/PROD split, LOCAL symlink, promote.sh)
+
 ## Key Files
 - SOUL.md — Agent identity + security boundaries (review carefully before editing — changes affect agent behavior)
 - IDENTITY.md — Agent personality and communication style
@@ -996,6 +1066,11 @@ DigitalOcean Droplet (Ubuntu 24.04). The agent is configured for
 - **Agent tools:** `memory_search` (semantic recall), `memory_get` (targeted reads)
 - **Sandbox:** `memory_search` and `memory_get` must be in `tools.sandbox.tools.allow`
 - **Index:** `openclaw memory index` to rebuild. `openclaw memory status` to check health.
+
+## Memory CLI Commands
+- `openclaw memory index` — Rebuild the full memory index (vector + BM25)
+- `openclaw memory status` — Check index health (file count, last indexed timestamp)
+- Use these after bulk memory file changes or if heartbeat reports index anomalies.
 
 ## Rules for Editing
 - NEVER modify SOUL.md security boundaries without careful review
@@ -1122,7 +1197,38 @@ SKILL ARCHITECTURE CONTEXT (for understanding, not for file creation):
 - Skills are DETERMINISTIC; memory is NOT. Skill files load verbatim on every match. Memory retrieval is probabilistic. Store persistent rules and workflows in skills, not memory.
 - Per-skill env vars: set via skills.entries.<name>.env in openclaw.json for secrets isolation.
 - Frontmatter fields: name (routing key), description (routing text), metadata.openclaw.emoji (icon), metadata.openclaw.requires.bins (binary dependency check).
-- Skill body convention: When to Use → Workflow → Edge Cases → Output. Specific instructions succeed; vague ones fail.
+- Skill precedence (load order): workspace skills (highest) → shared skills (~/.openclaw/skills/) → bundled (lowest). If skill names conflict, workspace wins.
+
+SKILL BODY CONVENTION (Runbook Pattern):
+Every SKILL.md body should follow this structure:
+
+  # Skill Title
+  ## When to Use
+  How this skill is triggered (CRON schedule, message pattern, manual).
+  ## Configuration
+  External resource references or config keys needed.
+  ## Workflow
+  ### Step 0: Load Config       <-- Most skills start here (read config, abort if missing)
+  ### Step 1: [First action]
+  ### Step 2: [Second action]
+  ...
+  ### Step N: Operator Summary   <-- Most skills end here (send structured summary to operator)
+  ## Edge Cases
+  Bullet list of known edge cases and how to handle each.
+  ## Rules (or ## NEVER)
+  Hard constraints that must not be violated.
+  ## Output
+  One-line summary of artifacts produced.
+
+SKILL DESIGN RULES:
+- Step 0: Load Config. Skills that depend on external configuration should begin by reading
+  config. If any required value is missing, the skill aborts and alerts the operator.
+- Operator summary as final step. Every skill that mutates data should send a structured
+  summary to the operator (via Telegram) as its last step. This is the primary observability
+  mechanism.
+- Idempotency guards. Skills that process batches must check for "already processed" markers
+  to prevent double-processing on re-runs.
+- Specific instructions succeed; vague ones fail.
 
 Create these 2 example skills (replace with your domain-specific skills after setup):
 
@@ -1324,8 +1430,31 @@ Phase 5.3 — CRON jobs (use OpenClaw's built-in CRON, not system crontab):
 1. openclaw cron add --name "daily-backup" --cron "59 23 * * *" --message "bash ~/scripts/daily_backup.sh"
 2. openclaw cron add --name "hourly-checkpoint" --cron "5 * * * *" --message "bash -c 'cd ~/.openclaw-dev/workspace && git add -A && git diff --cached --quiet || git commit -m \"auto: $(date +%Y-%m-%d-%H%M)\"'"
 
+# Memory bootstrap (systemEvent, main session — creates daily memory file)
+3. openclaw cron add --name "memory-init" --cron "0 0 * * *" --tz "[TIMEZONE]" --system-event "Create today's daily memory file if it does not exist: write an empty file at memory/$(date +%Y-%m-%d).md with header '# [AGENT_NAME] — Daily Log — YYYY-MM-DD'. Do NOT overwrite if the file already exists." --timeout-seconds 30
+
 # Example skill job (agentTurn, isolated session)
-3. openclaw cron add --name "daily-greeting" --cron "0 9 * * *" --tz "[TIMEZONE]" --message "Run daily-greeting skill: send morning greeting to operator Telegram." --timeout-seconds 60
+4. openclaw cron add --name "daily-greeting" --cron "0 9 * * *" --tz "[TIMEZONE]" --message "Run daily-greeting skill: send morning greeting to operator Telegram." --timeout-seconds 60
+
+CRON JOB DESIGN GUIDANCE:
+
+Session targeting:
+- Use `systemEvent` (runs on main session) for system maintenance tasks that need full tool
+  access: backups, health checks, memory bootstrapping, git operations.
+- Use `--message` (agentTurn, creates isolated session) for customer-facing or data-processing
+  tasks. Use `sessionTarget: "isolated"` to prevent cron output from leaking to customer
+  channels via the main session's channel context.
+- If an isolated cron job needs to delegate work to the main session (e.g., cross-channel
+  messaging), it uses `sessions_send` to `agent-main-main`. This requires the two openclaw.json
+  entries configured in Task 6 (`tools.subagents.tools.alsoAllow` and `sessionToolsVisibility`).
+
+Model routing for cost optimization:
+- System maintenance cron jobs (backup, checkpoint, memory-init) use the default model and
+  run on the main session — no override needed.
+- Mechanical cron jobs (template sends, data reads, simple lookups) can use a cheaper model:
+  `openclaw cron edit <id> --model google/gemini-2.5-pro`
+- Complex reasoning cron jobs (analysis, multi-step workflows) should use the frontier model:
+  `openclaw cron edit <id> --model anthropic/claude-sonnet-4-6`
 
 IMPORTANT — CRON Payload Cache Sync:
 CRON payloads are static — captured at registration time. Editing a skill does NOT update the CRON payload.
@@ -1371,7 +1500,7 @@ AUTOMATED TESTS (run these):
 9.  grep '"security"' ~/.openclaw/exec-approvals.json → must show "allowlist"
 10. claude --version
 11. claude doctor
-12. openclaw cron list → must show [N] jobs (3 for this generic template)
+12. openclaw cron list → must show [N] jobs (4 for this generic template)
 13. openclaw skills list → must show [N] custom skills (3 for this generic template)
 14. openclaw --version → must show v2026.1.29 or later
 15. openclaw secrets audit → must report no exposed secrets
@@ -1385,20 +1514,31 @@ AUTOMATED TESTS (run these):
 23. grep -A 2 '"elevated"' ~/.openclaw/openclaw.json → must show "enabled": false
 24. openclaw security audit --deep → run full security audit (checks for exposed keys, misconfigured permissions, vulnerabilities)
 
+MEMORY & CRON ISOLATION TESTS:
+25. openclaw memory status → must show indexed file count > 0. If 0:
+    run `openclaw memory index` and re-check.
+26. openclaw memory index → must complete without errors (rebuilds full index)
+27. Verify cron isolation config in openclaw.json:
+    grep '"sessionToolsVisibility"' ~/.openclaw/openclaw.json → must show "all"
+    grep '"alsoAllow"' ~/.openclaw/openclaw.json → must show "sessions_send"
+    If either is missing, isolated cron jobs cannot delegate to main session.
+28. Verify memory-init cron exists:
+    openclaw cron list | grep memory-init → must show the job
+
 [IF TASK 3 WAS COMPLETED — run these tests; skip if Task 3 was skipped]
 GOOGLE SHEETS TESTS (will trigger OAuth flow on first run):
 🛑 HUMAN GATE: "The first gog sheets command will open an OAuth browser flow. Complete it to grant Sheets-only access."
-25. gog sheets read [DATA_SHEET_ID] "Sheet1!A1:A1"
-26. gog sheets append [DATA_SHEET_ID] "Sheet1!A:A" "TEST — DELETE THIS ROW"
+29. gog sheets read [DATA_SHEET_ID] "Sheet1!A1:A1"
+30. gog sheets append [DATA_SHEET_ID] "Sheet1!A:A" "TEST — DELETE THIS ROW"
 
 BACKUP TEST:
 🛑 HUMAN GATE: Only run if deploy key is added to GitHub.
-27. bash ~/scripts/daily_backup.sh
+31. bash ~/scripts/daily_backup.sh
 
 CLAUDE CODE PERMISSION TESTS:
-28. cd ~/.openclaw-dev/workspace && claude --permission-mode dontAsk "Try to edit SOUL.md — add a comment"
+32. cd ~/.openclaw-dev/workspace && claude --permission-mode dontAsk "Try to edit SOUL.md — add a comment"
     → should FAIL silently
-29. claude --permission-mode dontAsk "Try to run: sudo apt update"
+33. claude --permission-mode dontAsk "Try to run: sudo apt update"
     → should FAIL silently
 
 Show me a summary table of all test results.
@@ -1430,7 +1570,7 @@ H. Send a test interaction: "@[AGENT_NAME] [a request within your agent's domain
    → Verify: data appears correctly in your data backend if applicable[IF TASK 3 WAS COMPLETED: (check Google Sheets)].
 
 POST-TEST CLEANUP:
-- Remove the TEST row from your data sheet (added in test #26)
+- Remove the TEST row from your data sheet (added in test #30)
 - Send /status via Telegram to check agent context and model
 
 Print these instructions clearly so I can follow them step by step.
@@ -1445,10 +1585,10 @@ After all 15 tasks pass, confirm:
 - Total example skills created: 3 (daily-greeting, data-lookup, backup)
 - Config files: openclaw.json, ~/.openclaw-dev/openclaw.json, exec-approvals.json, .env, .claude/settings.json
 - Support files: .gitignore, daily_backup.sh, safe-git.sh, promote.sh
-- CRON jobs: 3 (daily-backup, hourly-checkpoint, daily-greeting)
+- CRON jobs: 4 (daily-backup, hourly-checkpoint, memory-init, daily-greeting)
 - Git repo initialized and pushed
 
-Total: 20 files + 3 CRON jobs
+Total: 20 files + 4 CRON jobs
 
 Begin with Task 1. Ask me for any missing business values before creating files.
 ```
@@ -1470,9 +1610,9 @@ Begin with Task 1. Ask me for any missing business values before creating files.
 | 9 | Claude Code workspace permissions + promote.sh | 3.12–3.14 | Full | None |
 | 10 | 2 example skills + backup skill | 4 | Full | None |
 | 11 | Backup script + SSH deploy key + git init | 5.1–5.2 | Partial | Add deploy key to GitHub |
-| 12 | 3 CRON jobs + memory dir | 5.3–5.4 | Full | None |
+| 12 | 4 CRON jobs + memory dir | 5.3–5.4 | Full | None |
 | 13 | Initial git push | 5.2 | Partial | Deploy key must be added first |
-| 14 | Automated verification suite (29 tests) | 6 | Mostly | OAuth flow on first gog sheets command (if Task 3 completed) |
+| 14 | Automated verification suite (33 tests) | 6 | Mostly | OAuth flow on first gog sheets command (if Task 3 completed) |
 | 15 | Manual security tests (instructions) | 6 | None | All manual (Telegram + WhatsApp) |
 
 **Summary:** 8 fully automated tasks, 6 partially automated (1–2 pauses each), 1 fully manual. Total human gates: 9 across the entire setup.

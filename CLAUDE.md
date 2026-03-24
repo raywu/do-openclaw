@@ -14,6 +14,8 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 
 **Other:**
 - **`prompt-multi-agent-openclaw-setup.md`** — Multi-agent orchestration prompt (pre-v3, not yet updated)
+- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns
+- **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
 - **`references/reference-openclaw-order-crm-tools-skills.md`** — Order/CRM skill reference
 - **`references/reference-openclaw-shopify-gmail-research-report.md`** — Shopify/Gmail integration research
@@ -31,9 +33,14 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **CRON version control**: `jobs.json` is snapshotted into `workspace/cron/` by hourly checkpoint and tracked in git
 - **Models**: primary `anthropic/claude-sonnet-4-6`, fallback `google/gemini-2.5-pro`; roster includes `gemini-3-pro-preview` and `claude-sonnet-4-5`
 - **Sandbox**: `non-main` mode, `openclaw-sandbox:bookworm-slim`, 512m memory, 128 PIDs, read-only root, workspace read-only in sandbox
+- **Cron isolation**: `sessionTarget: "isolated"` prevents cron output leaking to customer channels; system tasks use `systemEvent` on main session
+- **`sessions_send` from isolated cron (v2026.3.8+)**: requires `tools.subagents.tools.alsoAllow: ["sessions_send"]` and `agents.defaults.sandbox.sessionToolsVisibility: "all"` — without both, isolated cron delegation silently fails
+- **Prompt caching**: `cacheRetention: "long"` in `agents.defaults.models` for Anthropic models with >5 min interaction gaps; Anthropic-only feature
+- **LOCAL env (optional)**: symlink workspace to git repo for immediate visibility during development — no promote step needed
 
 ## Key Concepts
 
+- **Context injection order**: SOUL.md → AGENTS.md → TOOLS.md → USER.md → MEMORY.md → daily memory → matching skills
 - **Workspace files** (SOUL.md, IDENTITY.md, AGENTS.md, TOOLS.md, USER.md, HEARTBEAT.md, BOOT.md, CLAUDE.md, MEMORY.md, SYSTEM_LOG.md) define agent identity, behavior, and state — loaded into system prompt each message
 - **Dual enforcement model**: soft (LLM reasoning via workspace markdown) + hard (Gateway tool policies, sandbox, OS-level containment)
 - **Skills** are `SKILL.md` files with YAML frontmatter in `~/.openclaw/workspace/skills/<name>/`
