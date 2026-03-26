@@ -1,6 +1,6 @@
 # OpenClaw Design Patterns & Architecture Reference
 
-<!-- last-verified: 2026-03-23 | openclaw: 2026.2.15 -->
+<!-- last-verified: 2026-03-26 | openclaw: 2026.3.8 -->
 
 > **Purpose:** Persistent reference for understanding OpenClaw's architecture,
 > design patterns, and operational conventions. Derived from production
@@ -143,6 +143,30 @@ When adding or editing a workspace skill, verify these:
 6. **Tests** — run tests to catch regressions
 7. **Git review** — `git diff` to review all changes before committing
 
+### Verbatim Template Embedding
+
+Customer-facing messages sent by cron jobs on smaller models (haiku-class, mini-class) must have their templates embedded **verbatim** in the cron prompt — not just referenced in SKILL.md. Without the literal template text in the prompt, smaller models will freestyle the message content: rewriting phrasing, omitting fields, or adding unsolicited content.
+
+**Pattern:** Include the full message template in the cron prompt with the instruction: `"Use this EXACT template — substitute all {variables} with actual values from the data you read."` The template should contain every line, every field label, and every placeholder exactly as it should appear in the final message.
+
+This applies to both group messages (announcements, blasts) and individual DMs (reminders, confirmations). On-demand skills triggered via frontier models (Sonnet-class) are less prone to this but should still include a `"Send this message VERBATIM"` reinforcement before the template block in SKILL.md.
+
+### `exec curl -sf` Literal Pattern
+
+Sandbox sessions cannot make HTTP calls via prose description. Writing "POST to the endpoint at `[URL]`" in a SKILL.md will cause smaller models (codex-mini class, haiku) to describe the call or reason about it rather than execute it. The SKILL.md must include the literal `exec curl` command.
+
+**Pattern:**
+```
+Step 1: [Action name]
+Run: exec curl -sf -X POST http://localhost:[PORT]/api/internal/[ENDPOINT] \
+  -H "Content-Type: application/json" \
+  -d '{"key": "[VALUE]"}'
+```
+
+The `-s` (silent) and `-f` (fail on HTTP error) flags are non-optional:
+- `-s` prevents curl progress output from polluting the agent's context
+- `-f` ensures non-2xx responses surface as tool errors rather than silent HTML error pages
+
 ---
 
 ## 3. Session & Sandbox Model
@@ -192,6 +216,37 @@ Sandboxed sessions can reply within their own channel (text output auto-delivers
 
 **Best practice:** Do NOT add `message` to sandbox tools. Instead, route cross-channel operations through `agent-main-main` via `sessions_send`. Adding `message` to sandbox grants cross-channel messaging to ALL sandboxed sessions (customer DMs, isolated crons, groups), creating a large blast radius if any session is compromised or confused.
 
+### Three-Layer DM Delivery Protection
+
+Preventing unintended DM delivery requires three independent defense layers. Any single layer has gaps — all three are needed:
+
+1. **`message` tool excluded from sandbox allowlist.** Sandbox sessions cannot initiate cross-channel messages. They can only reply within their own channel via text output auto-delivery.
+2. **`delivery.mode: "none"` on all cron jobs.** Without this, cron output auto-delivers to the main session's last active channel. If the operator's last interaction was in a customer DM, cron output leaks to that customer.
+3. **Hourly auto-prune of temporary DM sessions.** An hourly checkpoint script removes stale `[channel]:direct` sessions created by sandbox activity. This prevents session accumulation from contaminating the main session's routing table.
+
+**Why all three?** Layer 1 prevents sandbox-initiated sends but doesn't stop auto-delivery from cron. Layer 2 stops cron auto-delivery but doesn't prevent `sessions_send` leaks. Layer 3 cleans up session artifacts that layers 1-2 miss.
+
+### Session Type to Tool Access Matrix
+
+| Session Type | Sandboxed | Tool Access | Notes |
+|---|---|---|---|
+| Main (`agent:main:main`) | No | Full | Operator commands, system ops |
+| Channel DM (`agent:main:[channel]:direct:[id]`) | Yes | Restricted | Customer interactions |
+| Isolated cron | Yes | Restricted | Scheduled jobs — commonly mistaken as unsandboxed |
+| Group (`agent:main:[channel]:group:[id]`) | Yes | Restricted | Mention-triggered responses |
+
+**Key misconception:** Isolated cron sessions ARE sandboxed. They run in Docker containers with the same tool restrictions as customer DM sessions. This is why cron jobs that need host-level access (file writes, system scripts) must target the main session via `systemEvent`.
+
+### Sandbox Tool Allowlist Enforcement
+
+Changes to `tools.sandbox.tools.allow` in `openclaw.json` require rebuilding sandbox containers:
+
+```bash
+openclaw sandbox recreate --all
+```
+
+**This is NOT a hot-reload operation.** Unlike workspace files (which hot-reload via file watcher), sandbox tool allowlists are baked into the container at creation time. Without `recreate`, existing containers continue running with the old allowlist. Tools not in the allowlist **silently fail** — the agent receives no error, the tool simply does nothing. This makes allowlist drift difficult to diagnose (the skill appears to succeed but produces no output).
+
 ### Context Compaction
 
 When a session's context window fills up, OpenClaw automatically summarizes older messages. For cron-triggered skills, this rarely matters since each cron invocation starts a fresh session. For long-running DM conversations, the agent should rely on memory files and external data reads rather than conversation history.
@@ -237,6 +292,10 @@ For on-demand skills that don't need main session capabilities, main can spawn a
 
 6. **Version-controlled cron snapshots.** Periodically snapshot cron jobs to a `cron/jobs.json` file in the workspace and track in git. This provides an audit trail and makes it easy to detect drift.
 
+7. **`delivery.mode: "none"` on all cron jobs.** Without this, cron output auto-delivers to the main session's last active channel. If the operator's last message was in a customer DM, cron output leaks to that customer. Set `delivery.mode: "none"` on every cron job and use explicit `message` tool calls (from main session) for intentional delivery.
+
+8. **Shell-script-only jobs use `systemEvent`, not `agentTurn`.** If a cron job only runs a shell script with no LLM reasoning needed (backups, health checks, file initialization), use `sessionTarget: "main"` with `triggerType: "systemEvent"`. This runs the script directly on the host without spinning up an agent session — saving tokens and latency. Reserve `agentTurn` for jobs that require LLM reasoning.
+
 ### Memory-Tag-Then-Batch Pattern
 
 When there is no real-time API to query historical data, use this two-phase pattern:
@@ -248,12 +307,19 @@ When there is no real-time API to query historical data, use this two-phase patt
 
 ### Model Routing
 
-Cost optimization via split model routing:
+Cost optimization via strategic model tiering:
 
-- Use a frontier model for the main session (complex reasoning, multi-step tasks)
-- Use cheaper models for cron jobs that are mechanical or template-driven
+| Tier | Model Class | Use Case |
+|------|-------------|----------|
+| Customer-facing crons | Smallest viable (haiku-class) | Template fidelity, low cost, verbatim output |
+| Light automation | Mini-class | Data extraction, formatting, tagging |
+| Medium complexity | Mid-tier | Multi-step workflows, conditional logic |
+| Complex / main session | Frontier | Reasoning, multi-resource mutations, operator interaction |
+
 - Per-cron model override: `openclaw cron edit <id> --model <model>`
 - Heartbeat model override: `heartbeat.model` in `openclaw.json`
+
+**Provider caveat:** `cacheRetention` is Anthropic-only. OpenAI and other providers silently ignore the parameter — no error, no caching behavior applied. When using mixed providers across tiers, only Anthropic-model cron jobs benefit from prompt caching.
 
 ### Cron Health Audit
 
@@ -265,6 +331,21 @@ Use HEARTBEAT.md to perform periodic audits of all cron jobs:
 4. Report anomalies to operator via trusted channel
 
 This catches silent failures early — a cron job that errored or was accidentally disabled will be surfaced within the hour rather than discovered days later.
+
+### Cron Schedule Auto-Sync
+
+When cron schedules are driven by external configuration (e.g., a config sheet or config file that stores order deadlines, blast times, or reminder windows), schedule drift is inevitable — someone updates the config but forgets to update the cron registration.
+
+**Pattern:** An hourly system cron (not OpenClaw cron) compares config-derived schedule expressions against live `openclaw cron list` output and auto-fixes discrepancies. The sync script should only modify schedule expressions — never payloads, models, or other job parameters.
+
+```bash
+# Example: sync-cron-from-config.sh (runs via system crontab, not OpenClaw)
+# 1. Read config source (file, API, sheet) for expected schedules
+# 2. Compare against `openclaw cron list --json`
+# 3. For each mismatch: `openclaw cron edit <id> --schedule "<new_expression>"`
+# 4. Log changes to SYSTEM_LOG.md
+# DRY_RUN=1 for preview mode
+```
 
 ---
 
@@ -302,6 +383,12 @@ Rather than granting broad `exec` access, restrict to a specific set of executab
 ```
 
 Only listed executables can be invoked via `exec`. All other exec calls are denied.
+
+### Per-Environment Channel Discovery
+
+Workspace files should never hardcode channel targets (Telegram user IDs, WhatsApp group JIDs, bot tokens). Instead, the agent discovers channel targets from gateway config at runtime. This enables the same workspace to work across LOCAL, DEV, and PROD environments without modification.
+
+**Pattern:** `openclaw.json` specifies per-environment channel bindings (group JID, bot token, DM policy). Skills reference channels by role ("operator channel", "customer group") rather than by ID. The agent resolves the role to a concrete channel target from the gateway's channel configuration.
 
 ### Security Boundaries (SOUL.md)
 
@@ -367,35 +454,154 @@ Agent tools: memory_search (semantic), memory_get (targeted)
 3. **Operator always gets a summary.** Every skill that sends customer messages also sends a rollup to the operator via a trusted channel.
 4. **Never mix channels in sandbox.** A skill that runs in sandbox must not send messages to channels outside its own. It delegates to main session if cross-channel notification is needed.
 
+### Pre/Post-Write Guardrails
+
+For skills that mutate external data (updating rows, writing records), use pre/post-write verification to catch silent corruption:
+
+- **Before write:** Re-read the target row/record and verify identity fields (e.g., record ID, timestamp + name) match the intended target. Row insertions, concurrent edits, or stale caches can cause off-by-one writes.
+- **After write:** Re-read the written cells/record and confirm the values persisted correctly. API partial failures, rate limits, or schema mismatches can cause silent drops.
+
+This adds two extra reads per write but catches data corruption that would otherwise go undetected until a customer reports it.
+
+### Date Computation Verification
+
+When skills compute future dates (pickup dates, deadlines, reminder windows), use two-layer validation:
+
+1. **Static tests (build time):** Verify the skill references the correct config keys for date parameters and includes a verification step in its workflow.
+2. **Runtime Verify step:** After computing the date, the skill checks the result against the expected day-of-week or range. If the computed date is wrong (LLM arithmetic errors are common), the Verify step adjusts forward to the next valid date.
+
+This catches errors that static tests cannot — the LLM may correctly reference the right config key but still miscalculate the date.
+
 ---
 
 ## 8. Environment Architecture
 
-### DEV / PROD Split
+### Three-Environment Model
 
-| Aspect | DEV | PROD |
-|--------|-----|------|
-| State directory | `~/.openclaw-dev/` | `~/.openclaw/` |
-| Gateway port | 18790 (or custom) | 18789 |
-| Gateway flag | `openclaw --dev` | `openclaw gateway start` |
-| Workspace | `~/.openclaw-dev/workspace/` (git-tracked) | `~/.openclaw/workspace/` (deployed artifact) |
-| Channels | None or sandbox channels | Live channels |
-| Cron | None or test cron | Live cron jobs |
+| Aspect | LOCAL | DEV | PROD |
+|--------|-------|-----|------|
+| Location | Developer workstation | Droplet | Droplet |
+| State directory | `~/.openclaw-dev/` (symlinked) | `~/.openclaw-dev/` (rsync'd) | `~/.openclaw/` |
+| Gateway port | 19001 (auto via `--dev`) | 19001 (auto via `--dev`) | 18789 |
+| Gateway flag | `openclaw --dev` | `openclaw --dev` | `openclaw gateway start` |
+| Workspace source | Git repo (symlink) | rsync from LOCAL | rsync from LOCAL or DEV |
+| Channels | None or test | None or sandbox test channel | Live channels |
+| Cron | None | Idle (cost control) | Live cron jobs |
 
-**Promotion:** `promote.sh` syncs DEV workspace to PROD with git-aware safety checks (refuses on uncommitted changes, shows diff, requires confirmation).
+- **LOCAL** is the developer's workstation. The workspace is the git repo, symlinked to `~/.openclaw-dev/workspace`. Edits are immediately visible to the DEV gateway — no promote step needed. Used for rapid iteration.
+- **DEV** is an idle staging environment on the Droplet. Its workspace is rsync'd from LOCAL. Cron jobs are registered but idle by default (zero token cost). Used for integration testing with real channels in sandbox mode.
+- **PROD** is the live deployment on the Droplet. Its workspace is a deployed artifact — never edited directly. Cron jobs are live.
 
-### LOCAL Environment (Optional)
+### DEV Auto-Shutdown
 
-For rapid iteration, symlink the PROD or DEV workspace to your git repo:
+To prevent token burn from forgotten DEV instances, use a system cron (not OpenClaw cron) as a watchdog:
 
 ```bash
-ln -sf /path/to/your/repo ~/.openclaw-dev/workspace
+# System crontab: check every 5 minutes, shut down DEV if idle >60 minutes
+*/5 * * * * /path/to/scripts/dev-watchdog.sh --idle-threshold 60
 ```
 
-Edits to workspace files are immediately visible to the DEV gateway — no promote step needed. This is useful during initial development but should not be used for production.
+The watchdog checks the DEV gateway's last activity timestamp. If no operator interaction has occurred within the threshold, it stops the DEV gateway. This is critical — DEV cron jobs left running silently consume tokens with no production value.
+
+### Config Drift Prevention
+
+Periodically diff DEV vs PROD configs to catch unintended divergence:
+
+```bash
+diff <(jq 'del(.channels, .cron)' ~/.openclaw-dev/openclaw.json) \
+     <(jq 'del(.channels, .cron)' ~/.openclaw/openclaw.json)
+```
+
+Exclude environment-specific keys (channels, cron schedules) and focus on structural config: tool policies, sandbox settings, model routing, and security boundaries. Non-env-specific differences should be investigated and reconciled.
 
 ### Environment Behavior for DMs
 
 - **PROD:** Messages sent to real recipients
-- **DEV/LOCAL:** Messages redirected to operator's own phone/account with a `[DEV]` prefix
+- **DEV/LOCAL:** Messages redirected to operator's own phone/account with a `[DEV]` prefix, or restricted via `dmPolicy: "pairing"`
 - **TEST:** No-op, returns `{ok: true}`
+
+---
+
+## 9. Promotion Workflow
+
+### Promotion Script Family
+
+| Script | Direction | Scope | Use Case |
+|--------|-----------|-------|----------|
+| `promote.sh` | LOCAL -> PROD | Full workspace | Production deployment |
+| `promote-dev.sh` | LOCAL -> DEV | Full workspace | Staging deployment |
+| `promote-skill.sh [SKILL_NAME]` | LOCAL -> PROD | Single skill directory | Hot-fix a specific skill |
+| `auto-promote.sh` | Git -> DEV | Full workspace (on merge) | CI/CD auto-deploy to staging |
+| `rollback.sh [COMMIT_SHA]` | Git history -> PROD | Full workspace | Emergency rollback |
+
+### `promote.sh` Behavior
+
+1. Refuse if LOCAL workspace has uncommitted changes
+2. rsync LOCAL workspace to PROD, excluding `.git/`, `.claude/`, `tests/`, `scripts/`
+3. Swap environment-specific IDs (e.g., DEV config sheet ID -> PROD config sheet ID)
+4. Show diff of changes, require operator confirmation
+5. No gateway restart needed — workspace files hot-reload via file watcher
+
+### `auto-promote.sh` (CI/CD Pattern)
+
+A system cron (every minute) on the Droplet runs:
+
+1. `git fetch && git merge --ff-only origin/master`
+2. If new commits: run tests
+3. If tests pass: `promote-dev.sh` (or `promote.sh` for PROD auto-deploy)
+4. Notify operator via Telegram with commit summary
+
+### `rollback.sh` Behavior
+
+1. `git checkout [COMMIT_SHA] -- workspace/` to restore workspace files
+2. Run `auto-promote.sh` to deploy the rolled-back state
+3. Notify operator via Telegram
+
+### PROD-Owned Files
+
+These files are never overwritten by promotion — they are owned by the PROD agent:
+
+- `MEMORY.md` and `memory/` directory (runtime state)
+- `SYSTEM_LOG.md` (audit trail)
+- `cron/jobs.json` (registered cron snapshot)
+
+---
+
+## 10. Anti-Patterns
+
+Production-discovered mistakes that cause silent failures or data leaks:
+
+| Anti-Pattern | Why It Fails | Impact |
+|---|---|---|
+| `sessions_send` for customer DMs | A2A echo loop bug (#7804) — main auto-replies to itself | Infinite message loop between sessions |
+| `openclaw message send` CLI for DMs | Creates `[channel]:direct` sessions on main | Contaminates main session's routing table; internal messages leak to customers |
+| HTTP calls described in prose | Smaller models interpret prose as description, not action | Silent no-op — skill appears to succeed but sends nothing |
+| `agentTurn` for shell-script-only jobs | Spins up full LLM agent session unnecessarily | Wasted tokens and latency |
+| DEV cron jobs left running | Token consumption with no production value | Budget burn |
+| Sandbox allowlist change without `recreate --all` | Old containers retain stale allowlist | Silent tool failures in sandbox |
+| Cron without `delivery.mode: "none"` | Output auto-delivers to main's last active channel | Cron output leaks to customer DMs |
+| Hardcoded channel targets in workspace | Workspace tied to single environment | Breaks LOCAL/DEV/PROD portability |
+
+---
+
+## 11. CLI-to-API Migration Pattern
+
+As an agent deployment matures, direct CLI access to external services (e.g., `gog` for Google Sheets, `gh` for GitHub) can be replaced with server-side internal API endpoints. This is not required but offers significant benefits.
+
+### Pattern
+
+1. Build a lightweight internal API server (e.g., Next.js, Express) on `localhost:[PORT]`
+2. Migrate SKILL.md steps from CLI commands to `exec curl -sf` calls against internal endpoints
+3. Server handles authentication, caching, rate limiting, and data access
+4. Skills POST to `http://localhost:[PORT]/api/internal/[ENDPOINT]`
+
+### Benefits
+
+- **Eliminates OAuth token exposure in sandbox.** CLI tools require credentials in the environment; the API server holds credentials server-side.
+- **Centralizes data access control.** One place to enforce read/write permissions, audit logging, and rate limits.
+- **Enables local caching.** The server can cache frequently-read data (config, customer lists) in SQLite or memory, reducing external API calls.
+- **Decouples agent from external API changes.** If the external service changes its API, only the server adapter needs updating — not every skill.
+
+### Migration Strategy
+
+Migrate incrementally: start with the most frequently called CLI command, add the internal endpoint, update skills one at a time. Keep the CLI tool in the exec allowlist as a fallback during migration.

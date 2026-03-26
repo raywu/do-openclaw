@@ -112,3 +112,22 @@ invalidates and must be re-cached. This is tracked upstream as
 [openclaw/openclaw#6540](https://github.com/openclaw/openclaw/issues/6540).
 The v2026.2.23 "bootstrap caching per session" partially mitigates this for
 mid-session memory writes.
+
+**Practical implication:** Any workspace file edit (SOUL.md, MEMORY.md, skill
+changes) invalidates the cache for all sessions. Plan workspace edits during
+low-traffic windows to minimize re-caching cost.
+
+---
+
+## Provider-Specific Behavior
+
+| Provider | `cacheRetention` | Auto-Applied Headers | Notes |
+|---|---|---|---|
+| Anthropic | Honored (`short`/`long`/`none`) | `cache_control: { type: "ephemeral" }`, `extended-cache-ttl-2025-04-11` beta flag | Full support |
+| OpenAI | Silently ignored | None | Parameter accepted without error but no caching behavior applied |
+| Google | N/A | Provider manages caching internally | Not configurable via OpenClaw |
+
+When using mixed model providers across cron tiers (e.g., Anthropic for
+customer-facing, OpenAI for automation), only Anthropic-model jobs benefit from
+`cacheRetention`. This is expected — do not add `cacheRetention` to
+non-Anthropic model configs (it wastes config lines but has no effect).

@@ -14,7 +14,7 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 
 **Other:**
 - **`prompt-multi-agent-openclaw-setup.md`** — Multi-agent orchestration prompt (pre-v3, not yet updated)
-- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns
+- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration
 - **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
 - **`references/reference-openclaw-order-crm-tools-skills.md`** — Order/CRM skill reference
@@ -34,6 +34,8 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **Models**: primary `anthropic/claude-sonnet-4-6`, fallback `google/gemini-2.5-pro`; roster includes `gemini-3-pro-preview` and `claude-sonnet-4-5`
 - **Sandbox**: `non-main` mode, `openclaw-sandbox:bookworm-slim`, 512m memory, 128 PIDs, read-only root, workspace read-only in sandbox
 - **Cron isolation**: `sessionTarget: "isolated"` prevents cron output leaking to customer channels; system tasks use `systemEvent` on main session
+- **Cron delivery mode**: `delivery.mode: "none"` on ALL cron jobs — without this, output auto-delivers to main session's last active channel
+- **Sandbox allowlist rebuild**: changes to `tools.sandbox.tools.allow` require `openclaw sandbox recreate --all` — NOT hot-reloaded
 - **`sessions_send` from isolated cron (v2026.3.8+)**: requires `tools.subagents.tools.alsoAllow: ["sessions_send"]` and `agents.defaults.sandbox.sessionToolsVisibility: "all"` — without both, isolated cron delegation silently fails
 - **Prompt caching**: `cacheRetention: "long"` in `agents.defaults.models` for Anthropic models with >5 min interaction gaps; Anthropic-only feature
 - **LOCAL env (optional)**: symlink workspace to git repo for immediate visibility during development — no promote step needed
@@ -50,7 +52,8 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
   - Agent writes daily observations and updates MEMORY.md when durable facts change
   - Boot and heartbeat checks verify memory index is non-empty
   - `memory_search` and `memory_get` must be in `tools.sandbox.tools.allow` — auto-detection provisions the index but sandbox blocks tool use without explicit allow
-- **DEV/PROD split**: `~/.openclaw-dev/` is the isolated DEV state dir (`--dev` flag); `~/.openclaw/` is PROD. DEV workspace (`~/.openclaw-dev/workspace/`) is the git repo and Claude Code root. `promote.sh` syncs dev → prod with git-aware safety checks.
+- **Three-environment model**: LOCAL (developer workstation, symlinked workspace) → DEV (Droplet, idle staging) → PROD (Droplet, live). All use `~/.openclaw-dev/` for LOCAL/DEV, `~/.openclaw/` for PROD. `promote.sh` family handles deployment.
+- **Promotion scripts**: `promote.sh` (LOCAL→PROD), `promote-dev.sh` (LOCAL→DEV), `promote-skill.sh` (single skill), `auto-promote.sh` (CI/CD), `rollback.sh` (emergency)
 
 ## Git
 

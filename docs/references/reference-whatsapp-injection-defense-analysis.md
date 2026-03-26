@@ -51,6 +51,20 @@ These attacks target tools the agent DOES have access to. The sandbox provides s
 
 ---
 
+## DM Delivery Leak Patterns
+
+Production-discovered delivery leaks that bypass tool-level protections:
+
+| Leak Vector | Mechanism | Impact | Defense |
+|---|---|---|---|
+| **`sessions_send` auto-delivery** | Main session auto-delivers output to its last active channel. If that was a customer DM, `sessions_send` output from cron leaks to the customer. | Internal operator messages appear in customer DMs | `delivery.mode: "none"` on all cron jobs |
+| **`openclaw message send` CLI** | Creates `[channel]:direct` sessions on the main session's routing table. These persist and contaminate future routing decisions. | Non-deterministic message delivery; internal messages routed to customers | Never use CLI for DM delivery; use server-side DM delivery or `message` tool from main session |
+| **Sandbox tool allowlist as security perimeter** | The sandbox allowlist is not just a convenience feature — it is a security boundary. Tools not in the allowlist silently fail with no error. | Skills appear to succeed but produce no output (e.g., no DMs sent) | Audit allowlist against skill dependencies; `openclaw sandbox recreate --all` after changes |
+
+**Key insight:** DM delivery is the hardest attack surface to secure because it involves non-deterministic routing (which session, which channel, which recipient). The defense requires three independent layers working together — see `reference-openclaw-design-patterns.md` Section 3 "Three-Layer DM Delivery Protection."
+
+---
+
 ## The Big Gaps
 
 ### Gap 1: The agent can read sensitive data AND send messages to the group

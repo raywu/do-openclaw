@@ -1456,6 +1456,17 @@ Model routing for cost optimization:
 - Complex reasoning cron jobs (analysis, multi-step workflows) should use the frontier model:
   `openclaw cron edit <id> --model anthropic/claude-sonnet-4-6`
 
+IMPORTANT — delivery.mode on ALL cron jobs:
+After registering each job, set delivery.mode to "none" to prevent cron output from auto-delivering
+to the main session's last active channel (which may be a customer DM):
+  openclaw cron edit <id> --params '{"delivery": {"mode": "none"}}'
+Without this, cron output leaks to whichever channel the operator last interacted with.
+
+IMPORTANT — Sandbox tool allowlist:
+After any change to tools.sandbox.tools.allow in openclaw.json, rebuild sandbox containers:
+  openclaw sandbox recreate --all
+Without this, existing containers retain the old allowlist and tools silently fail.
+
 IMPORTANT — CRON Payload Cache Sync:
 CRON payloads are static — captured at registration time. Editing a skill does NOT update the CRON payload.
 When editing a skill with a corresponding CRON job:
@@ -1469,6 +1480,7 @@ Phase 5.4 — Create the memory directory:
 4. mkdir -p ~/.openclaw-dev/workspace/memory
 
 Verify CRON jobs: openclaw cron list — show me the output.
+Verify delivery.mode: openclaw cron list --json | jq '.[].delivery.mode' — all must show "none".
 
 ═══════════════════════════════════════════════════════════
 TASK 13: Run Initial Git Backup
