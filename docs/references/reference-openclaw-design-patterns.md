@@ -214,7 +214,9 @@ Channel-specific DM sessions (`agent:main:telegram:direct:{id}`, `agent:main:wha
 
 Sandboxed sessions can reply within their own channel (text output auto-delivers), but CANNOT send to a different channel unless the `message` tool is explicitly added to `tools.sandbox.tools.allow`.
 
-**Best practice:** Do NOT add `message` to sandbox tools. Instead, route cross-channel operations through `agent-main-main` via `sessions_send`. Adding `message` to sandbox grants cross-channel messaging to ALL sandboxed sessions (customer DMs, isolated crons, groups), creating a large blast radius if any session is compromised or confused.
+**Default posture:** Do NOT add `message` to sandbox tools unless you have the three-layer DM delivery protection (below) in place. Adding `message` grants cross-channel messaging to ALL sandboxed sessions (customer DMs, isolated crons, groups). Without the delivery protection layers, this creates a large blast radius.
+
+**When to add `message` to sandbox:** If your agent needs to send DMs from sandbox sessions (e.g., customer reminders from isolated cron jobs), add `message` to `tools.sandbox.tools.allow` AND implement all three protection layers below. After changing the allowlist, run `openclaw sandbox recreate --all`.
 
 ### Three-Layer DM Delivery Protection
 
@@ -359,6 +361,12 @@ Three layers of tool policy, from broadest to most specific:
 2. **`AGENTS.md`** — workspace-level policies. Defines which tools are enabled, which require confirmation, and sandbox restrictions.
 3. **`SOUL.md`** — hard security boundaries. Non-negotiable constraints that override everything at the reasoning level.
 
+### Docker Sandbox Image
+
+The sandbox uses `openclaw-sandbox:bookworm-slim`, built from a Dockerfile. The base `debian:bookworm-slim` image has **no `curl`** — skills that use `exec curl` from sandbox will fail silently without it.
+
+**Build:** Create a `docker/sandbox.Dockerfile` that installs `curl` on top of the base image. Run your build script (idempotent, Docker layer cache makes it fast). After rebuilding the image, run `openclaw sandbox recreate --all` to replace running containers.
+
 ### Sandbox Tool Restrictions
 
 Sandbox sessions should follow a deny-by-default model. Common configuration:
@@ -383,6 +391,12 @@ Rather than granting broad `exec` access, restrict to a specific set of executab
 ```
 
 Only listed executables can be invoked via `exec`. All other exec calls are denied.
+
+### Exec-Approvals Cross-Contamination
+
+`exec-approvals.json` caches `lastResolvedPath` after the first successful exec call. If DEV and PROD share or copy this file, the resolved paths can point to the wrong environment's workspace (e.g., DEV patterns resolving to PROD paths).
+
+**Fix:** After copying `exec-approvals.json` between environments, clear all `lastResolvedPath` fields.
 
 ### Per-Environment Channel Discovery
 
@@ -581,6 +595,10 @@ Production-discovered mistakes that cause silent failures or data leaks:
 | Sandbox allowlist change without `recreate --all` | Old containers retain stale allowlist | Silent tool failures in sandbox |
 | Cron without `delivery.mode: "none"` | Output auto-delivers to main's last active channel | Cron output leaks to customer DMs |
 | Hardcoded channel targets in workspace | Workspace tied to single environment | Breaks LOCAL/DEV/PROD portability |
+| Operator notes in `delivery.mode: "announce"` output | Internal context included in agent's final output | Operator notes leak to customer-facing channel |
+| Cron scripts without explicit PATH export | `openclaw` binary (npm-installed) not on minimal shell PATH | Script silently fails or uses wrong binary |
+| Editing a skill without updating its cron prompt | Cron payloads are static — captured at registration time | Cron runs with stale instructions, ignoring skill changes |
+| Sharing `exec-approvals.json` across envs | `lastResolvedPath` caches point to wrong workspace | DEV exec calls resolve to PROD paths |
 
 ---
 
@@ -605,3 +623,79 @@ As an agent deployment matures, direct CLI access to external services (e.g., `g
 ### Migration Strategy
 
 Migrate incrementally: start with the most frequently called CLI command, add the internal endpoint, update skills one at a time. Keep the CLI tool in the exec allowlist as a fallback during migration.
+
+---
+
+## 12. Configuration Patterns
+
+### `openclaw.json` Key Sections
+
+| Section | Purpose |
+|---------|---------|
+| `agents.defaults.model` | Primary model and fallbacks |
+| `agents.defaults.heartbeat` | Heartbeat model, interval, target |
+| `agents.defaults.models` | All available models with aliases and params |
+| `channels.[channel]` | Per-channel config (group JID, DM policy, allowlist) |
+| `gateway` | Bind address, port, auth mode |
+| `agents.defaults.sandbox` | Sandbox config (mode, workspace access, session tools visibility) |
+| `tools.sandbox.tools.allow` | Whitelist of tools available in sandbox sessions |
+| `tools.subagents.tools.alsoAllow` | Override built-in subagent tool deny list |
+| `agents.defaults.sandbox.sessionToolsVisibility` | Session visibility for sandboxed sessions (`"spawned"` or `"all"`) |
+| `skills.load.extraDirs` | Additional skill directories to load |
+| `cron` | Scheduled job definitions |
+
+### Config Priority
+
+Environment variables > `openclaw.json` > built-in defaults.
+
+### Strict Schema Validation
+
+OpenClaw validates `openclaw.json` against a strict schema. Invalid keys or types cause startup failures. When making config changes, always specify the exact JSON path and expected type. Test config changes by restarting the gateway and checking for schema errors.
+
+### Cron Payload Cache Sync
+
+Cron payloads are **static** — captured at registration time. Editing a SKILL.md does NOT update the corresponding cron job's payload. When editing a skill that has a cron trigger:
+
+1. Edit the skill file
+2. Check if the cron payload conflicts with the updated skill
+3. If so: `openclaw cron edit <id> --message "<updated text>"` (agentTurn) or `--system-event "<updated text>"` (systemEvent)
+4. Prefer minimal trigger prompts ("Run the [SKILL_NAME] skill") over inline instructions to minimize drift
+
+---
+
+## 13. Operational Learnings
+
+Hard-won lessons from production debugging. Each entry caused a real incident or wasted significant debugging time.
+
+### PATH Issues in Cron Scripts
+
+Scripts invoked by OpenClaw cron jobs (`systemEvent`) run in a minimal shell environment. The `openclaw` binary (installed via npm) may not be on `$PATH`.
+
+**Fix:** All cron-invoked scripts should:
+1. Export the npm global bin directory to PATH: `export PATH="$HOME/.npm-global/bin:$PATH"`
+2. Use an `$OPENCLAW` env var (defaulting to `openclaw`) for CLI invocation
+3. Derive workspace paths dynamically from `$(dirname "$0")/..` rather than hardcoding
+
+### Delivery Mode Leaks
+
+The `delivery.mode: "announce"` setting on cron jobs sends the agent's final output to the configured channel. If the agent includes internal notes, debug info, or operator-only context in its output, that content leaks to the delivery channel.
+
+**Rule:** Skills with `delivery.mode: "announce"` must structure their output so only the customer-facing message appears. Internal summaries go to the operator channel via explicit `message` tool calls, not as part of the agent's conversational output. Better yet, use `delivery.mode: "none"` on all crons (see Section 4 Rule 7).
+
+### `sessions_send` Auto-Delivery Leak
+
+`sessions_send` to `agent:main:main` for customer DM delivery is dangerous. The main session's auto-delivery context routes responses to whatever channel was most recently active. If a customer DM session is active, ALL main session output — including internal reasoning, cron summaries, and debug text — auto-delivers to that customer.
+
+**Root cause:** Main session output routing is non-deterministic. Multiple fix attempts (session key format, stronger SOUL.md instructions) fail because the routing depends on gateway state, not agent reasoning.
+
+**Final fix pattern:** Server-side DM delivery. The internal API server calls `openclaw message send` CLI directly (via process execution) to deliver DMs through the gateway, bypassing agent sessions entirely. Skills return structured action objects (`{type: "[CHANNEL]_dm", phone, message}`) instead of sending messages themselves.
+
+**Rule:** Never use `sessions_send` for customer-facing message delivery. `sessions_send` is still valid for internal delegation (memory writes, data reads, sheet updates).
+
+### Port Fixup for Multi-Environment Skills
+
+When skills hardcode `localhost:[PORT]` for internal API calls, and DEV/PROD servers run on different ports (e.g., PROD on `:3000`, DEV on `:3001`), promotion scripts need port fixup.
+
+**Pattern:** `promote-dev.sh` runs sed to replace `:3000` → `:3001` in skill files. `promote.sh` reverses the replacement for PROD.
+
+**Gotcha:** The fixup sed must exclude the promotion scripts themselves — otherwise it rewrites the sed patterns inside `promote*.sh`, turning `s|3001|3000|` into `s|3001|3001|` (a no-op). Use `find -not -name 'promote*.sh'` in the fixup command.

@@ -131,3 +131,12 @@ When using mixed model providers across cron tiers (e.g., Anthropic for
 customer-facing, OpenAI for automation), only Anthropic-model jobs benefit from
 `cacheRetention`. This is expected — do not add `cacheRetention` to
 non-Anthropic model configs (it wastes config lines but has no effect).
+
+**Custom Anthropic proxies:** If routing through a custom proxy (not `provider: "anthropic"` directly), caching may be silently skipped. Tracked upstream: [openclaw/openclaw#37325](https://github.com/openclaw/openclaw/issues/37325).
+
+---
+
+## Version Requirements
+
+- **v2026.2.15:** Basic `cacheRetention` at model level
+- **v2026.2.23:** Per-agent overrides, bootstrap caching per session (reduces invalidations from mid-session memory writes), `OPENCLAW_CACHE_TRACE=1` diagnostics

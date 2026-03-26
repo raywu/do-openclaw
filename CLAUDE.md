@@ -14,7 +14,7 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 
 **Other:**
 - **`prompt-multi-agent-openclaw-setup.md`** — Multi-agent orchestration prompt (pre-v3, not yet updated)
-- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration
+- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration, configuration patterns, operational learnings
 - **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
 - **`references/reference-openclaw-order-crm-tools-skills.md`** — Order/CRM skill reference
@@ -36,6 +36,10 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **Cron isolation**: `sessionTarget: "isolated"` prevents cron output leaking to customer channels; system tasks use `systemEvent` on main session
 - **Cron delivery mode**: `delivery.mode: "none"` on ALL cron jobs — without this, output auto-delivers to main session's last active channel
 - **Sandbox allowlist rebuild**: changes to `tools.sandbox.tools.allow` require `openclaw sandbox recreate --all` — NOT hot-reloaded
+- **Sandbox Docker image**: base `debian:bookworm-slim` has no `curl`; must add to Dockerfile for `exec curl` skills
+- **Exec-approvals cross-contamination**: `lastResolvedPath` in `exec-approvals.json` caches per-env; clear when copying between envs
+- **Cron payload static**: editing a SKILL.md does NOT update the cron payload; must `openclaw cron edit` separately
+- **Strict schema validation**: `openclaw.json` is validated against strict schema; invalid keys cause startup failure
 - **`sessions_send` from isolated cron (v2026.3.8+)**: requires `tools.subagents.tools.alsoAllow: ["sessions_send"]` and `agents.defaults.sandbox.sessionToolsVisibility: "all"` — without both, isolated cron delegation silently fails
 - **Prompt caching**: `cacheRetention: "long"` in `agents.defaults.models` for Anthropic models with >5 min interaction gaps; Anthropic-only feature
 - **LOCAL env (optional)**: symlink workspace to git repo for immediate visibility during development — no promote step needed

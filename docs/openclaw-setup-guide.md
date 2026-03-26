@@ -877,6 +877,8 @@ sg docker -c "cd ~/.openclaw && bash scripts/sandbox-setup.sh"
 
 > **Note:** `sg docker -c "..."` runs the command with Docker group permissions in the current session. Do NOT use `newgrp docker` — it opens a new shell that won't persist across subsequent commands. After this session, the group membership takes effect on next login.
 
+> **IMPORTANT:** The base `debian:bookworm-slim` image has **no `curl`**. If your skills use `exec curl` from sandbox sessions, you must add `curl` to the sandbox Dockerfile. Without it, skills will fail silently — the `exec curl` command produces no output and no error.
+
 Verify the image was built: `docker images | grep openclaw-sandbox`
 
 Verify sandbox configuration is correct:
@@ -969,7 +971,11 @@ chmod 600 ~/.openclaw/exec-approvals.json
 
 > **Three layers of exec scoping:** (1) `exec-approvals.json` allowlist — only specific binaries are permitted; all other exec attempts are silently denied (`ask: "off"`, `askFallback: "deny"`). (2) `safe-git.sh` wrapper — restricts git subcommands to `add`, `commit`, `push`, `status`, `log`, `diff`, `rev-parse`, `show` only; blocks `remote`, `config`, `reset`, etc. (3) `SOUL.md` + `TOOLS.md` + `AGENTS.md` — reasoning-level constraints on what the agent should exec and when. Layer 1 is the hard gate; layers 2-3 are defense-in-depth.
 
+> **Cross-contamination warning:** `exec-approvals.json` caches `lastResolvedPath` after the first successful exec. If you copy this file between DEV and PROD environments, the resolved paths can point to the wrong workspace. After copying, clear all `lastResolvedPath` fields.
+
 Create the `safe-git.sh` wrapper referenced in the allowlist:
+
+> **PATH for cron scripts:** Scripts invoked by OpenClaw cron jobs (`systemEvent`) run in a minimal shell environment. The `openclaw` binary (npm-installed) may not be on `$PATH`. All cron-invoked scripts should export `$HOME/.npm-global/bin` to PATH and derive workspace paths dynamically from `$(dirname "$0")/..` rather than hardcoding.
 
 ```bash
 mkdir -p ~/scripts

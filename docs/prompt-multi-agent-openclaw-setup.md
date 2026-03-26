@@ -992,6 +992,10 @@ Phase 3.9 — The sandbox config in openclaw.json references a Docker image. Bui
    openclaw sandbox explain
    Should show: non-main sessions sandboxed, workspace read-only, resource limits active.
 
+IMPORTANT: The base debian:bookworm-slim image has NO curl. If your skills use
+`exec curl` from sandbox sessions, you must add curl to the sandbox Dockerfile.
+Without it, `exec curl` commands in skills will fail silently with no output.
+
 If scripts/sandbox-setup.sh doesn't exist, tell me — the OpenClaw version may handle this differently.
 
 --- VERIFICATION CHECKPOINT: TASK 7 ---
@@ -1051,6 +1055,8 @@ Phase 3.11 — Create ~/.openclaw/exec-approvals.json with this EXACT content:
 Add additional entries to the allowlist as needed for your domain (e.g., backup scripts, custom tooling). Each entry should be the resolved absolute path to the binary.
 
 chmod 600 ~/.openclaw/exec-approvals.json
+
+IMPORTANT — Cross-contamination: exec-approvals.json caches lastResolvedPath after first successful exec. If you copy this file between DEV and PROD, clear all lastResolvedPath fields — otherwise DEV exec calls may resolve to PROD paths.
 
 Create the safe-git.sh wrapper referenced in the allowlist:
 
