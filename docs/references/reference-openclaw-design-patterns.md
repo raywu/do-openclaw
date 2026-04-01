@@ -624,6 +624,30 @@ As an agent deployment matures, direct CLI access to external services (e.g., `g
 
 Migrate incrementally: start with the most frequently called CLI command, add the internal endpoint, update skills one at a time. Keep the CLI tool in the exec allowlist as a fallback during migration.
 
+### Auto-Migrate on Startup
+
+The internal API server should run database migrations automatically on every start. Using an ORM migration runner (e.g., Drizzle `migrate()`, Prisma `$migrate.deploy()`, Knex `migrate.latest()`) at module initialization ensures:
+
+- No separate migration CLI step in deployment
+- Schema changes deploy with the code that uses them
+- Promotion scripts only need to restart the server, not run migrations separately
+- Safe for SQLite (single-writer, no concurrent migration risk)
+
+**Pattern:** Call `migrate()` at the top level of the database module, before any route handlers initialize:
+
+```typescript
+// server/db/index.ts
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
+
+const db = drizzle(sqlite);
+migrate(db, { migrationsFolder: path.join(__dirname, "migrations") });
+
+export { db };
+```
+
+Every import of the database module triggers migration. New migration files are picked up automatically on the next server restart — no manual steps, no deployment scripts.
+
 ---
 
 ## 12. Configuration Patterns
@@ -699,3 +723,61 @@ When skills hardcode `localhost:[PORT]` for internal API calls, and DEV/PROD ser
 **Pattern:** `promote-dev.sh` runs sed to replace `:3000` → `:3001` in skill files. `promote.sh` reverses the replacement for PROD.
 
 **Gotcha:** The fixup sed must exclude the promotion scripts themselves — otherwise it rewrites the sed patterns inside `promote*.sh`, turning `s|3001|3000|` into `s|3001|3001|` (a no-op). Use `find -not -name 'promote*.sh'` in the fixup command.
+
+---
+
+## 14. A2A Architecture Principle
+
+<!-- status: reference | industry-verified: 2026-03-31 -->
+
+When agent-to-agent integration becomes a priority, the server — not the LLM agent — should be the A2A endpoint.
+
+### Core Principle
+
+**External agents should talk to deterministic JSON APIs, not LLM conversations.** The OpenClaw agent's role in A2A is messaging delivery only (DMs, notifications). All business logic — placing orders, checking status, retrieving catalogs — is pure database operations that require no LLM reasoning. Routing external agents through an LLM orchestrator adds latency, cost, and stochastic failure risk to deterministic pipelines.
+
+### Three Protocol Layers
+
+Build in this order — each layer wraps the previous one:
+
+| Layer | Protocol | Purpose | Audience |
+|-------|----------|---------|----------|
+| 1 | **OpenAPI REST** (`/api/v1/`) | Primary integration surface | Any HTTP client, LangChain, GPT agents, curl |
+| 2 | **MCP Server** (stdio/SSE) | Claude ecosystem tool discovery | Claude Code, MCP-aware agents |
+| 3 | **A2A Agent Card** (`/.well-known/agent.json`) | Agent discovery | Agent registries, search engines |
+
+Layer 1 (REST) handles 90%+ of integrations. Layer 2 (MCP) wraps the same endpoints as Claude-native tools. Layer 3 (Agent Card) is metadata for discovery — no new logic.
+
+### MCP vs A2A
+
+These are complementary protocols, not competing standards:
+
+- **A2A** (Agent-to-Agent Protocol, Linux Foundation): Agent discovers and collaborates with **other agents**. Peer-to-peer, opaque partners, task-oriented.
+- **MCP** (Model Context Protocol, Anthropic): Agent discovers and uses **tools and resources**. Client-server, tool exposure.
+
+An agent can use A2A to communicate with other agents while internally using MCP to access its own tools. Both emphasize structured data exchange (JSON), scoped authentication, and deterministic operations.
+
+### Authentication
+
+API key auth (`X-API-Key` header), per-agent, scoped, rate-limited. OAuth2 is overkill at small scale — API keys are simpler and sufficient for agent-to-agent use. Can be added later.
+
+**Scopes:** `[resource]:read`, `[resource]:write`, `admin` (reserved).
+
+### Agent Card for Discovery
+
+Serve a JSON metadata file at `/.well-known/agent.json` describing the agent's capabilities, supported protocols, and authentication requirements. This follows the A2A spec and enables agent registries and search engines to discover the agent programmatically.
+
+### Implementation Notes
+
+- All A2A code goes in the internal API server — zero OpenClaw changes needed
+- Reverse proxy (Caddy/nginx) must expose `/api/v1/*` and `/.well-known/` publicly
+- Internal APIs (`/api/internal/*`) remain localhost-only
+
+### Industry Alignment
+
+This architecture aligns with:
+- **Linux Foundation A2A Project** (launched April 2025) — task-scoped, deterministic, opaque agent collaboration
+- **NIST AI Agent Standards Initiative** (launched February 2026) — enterprise-grade identity, scoped privileges, interoperability
+- **Google A2A Protocol** — protocol-agnostic, Agent Card discovery, structured data exchange
+
+All three initiatives converge on deterministic APIs for routine operations, with LLMs reserved for tasks requiring reasoning.

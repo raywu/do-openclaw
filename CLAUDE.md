@@ -14,7 +14,7 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 
 **Other:**
 - **`prompt-multi-agent-openclaw-setup.md`** — Multi-agent orchestration prompt (pre-v3, not yet updated)
-- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration, configuration patterns, operational learnings
+- **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration (auto-migrate), configuration patterns, operational learnings, A2A architecture
 - **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
 - **`references/reference-openclaw-order-crm-tools-skills.md`** — Order/CRM skill reference
