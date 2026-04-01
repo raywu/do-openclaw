@@ -1589,7 +1589,7 @@ CRON DESIGN GUIDANCE:
 IMPORTANT — delivery.mode on ALL cron jobs:
 After registering each job, set delivery.mode to "none" to prevent cron output from auto-delivering
 to the main session's last active channel (which may be a customer DM):
-  openclaw cron edit <id> --params '{"delivery": {"mode": "none"}}'
+  openclaw cron edit <id> --delivery-mode none
 Without this, cron output leaks to whichever channel the operator last interacted with.
 
 IMPORTANT — Sandbox tool allowlist:
@@ -1610,7 +1610,7 @@ Phase 5.4 — Create the memory directory:
 4. mkdir -p ~/.openclaw-dev/workspace/memory
 
 Verify CRON jobs: openclaw cron list — show me the output.
-Verify delivery.mode: openclaw cron list --json | jq '.[].delivery.mode' — all must show "none".
+Verify delivery.mode: openclaw cron list --json | jq '.jobs[].delivery.mode' — all must show "none".
 
 --- VERIFICATION CHECKPOINT: TASK 12 ---
 Spawn a REVIEW AGENT to verify:

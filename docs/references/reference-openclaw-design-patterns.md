@@ -599,6 +599,9 @@ Production-discovered mistakes that cause silent failures or data leaks:
 | Cron scripts without explicit PATH export | `openclaw` binary (npm-installed) not on minimal shell PATH | Script silently fails or uses wrong binary |
 | Editing a skill without updating its cron prompt | Cron payloads are static — captured at registration time | Cron runs with stale instructions, ignoring skill changes |
 | Sharing `exec-approvals.json` across envs | `lastResolvedPath` caches point to wrong workspace | DEV exec calls resolve to PROD paths |
+| Hand-editing `openclaw.json` | Breaks internal config metadata tracking | Gateway restart loop with "missing-meta-vs-last-good" error |
+| Testing skills with `agent -m` only | Runs in main session, not sandbox | Misses exec-approvals, workspace ro, Docker, tool restrictions |
+| `$(command)` in heredocs sent via SSH | Evaluates on local machine, not droplet | Empty .env values, gateway crash-loops |
 
 ---
 
@@ -672,9 +675,23 @@ Every import of the database module triggers migration. New migration files are 
 
 Environment variables > `openclaw.json` > built-in defaults.
 
+### Workspace Path Defaults
+
+OpenClaw defaults to `~/.openclaw/workspace/` (shared) unless `agents.defaults.workspace` is explicitly set. Custom profiles (`--profile name`) create config at `~/.openclaw-$NAME/` but the workspace still defaults to the shared path. Always set `agents.defaults.workspace` explicitly in `openclaw.json` for each profile.
+
 ### Strict Schema Validation
 
-OpenClaw validates `openclaw.json` against a strict schema. Invalid keys or types cause startup failures. When making config changes, always specify the exact JSON path and expected type. Test config changes by restarting the gateway and checking for schema errors.
+OpenClaw validates `openclaw.json` against a strict schema. Invalid keys or types cause startup failures. Key gotchas:
+- `models` is a **record** `{model: {options}}`, not an array
+- `agents.list` items need `id`, not `name`
+- Cron jobs are registered at runtime via `openclaw cron add`, not in the config file
+
+Always use `openclaw config set` to modify config — never hand-edit `openclaw.json`. OpenClaw tracks config metadata internally; hand-editing breaks it, causing "Config observe anomaly: missing-meta-vs-last-good" errors and gateway restart loops.
+
+### Cron CLI Syntax
+
+- Set delivery mode: `openclaw cron edit <id> --delivery-mode none` (not `--params`)
+- `openclaw cron list --json` returns `{"jobs": [...]}` (a dict with a `jobs` key), not a bare array. Parse accordingly: `jq '.jobs[]'`
 
 ### Cron Payload Cache Sync
 
@@ -723,6 +740,46 @@ When skills hardcode `localhost:[PORT]` for internal API calls, and DEV/PROD ser
 **Pattern:** `promote-dev.sh` runs sed to replace `:3000` → `:3001` in skill files. `promote.sh` reverses the replacement for PROD.
 
 **Gotcha:** The fixup sed must exclude the promotion scripts themselves — otherwise it rewrites the sed patterns inside `promote*.sh`, turning `s|3001|3000|` into `s|3001|3001|` (a no-op). Use `find -not -name 'promote*.sh'` in the fixup command.
+
+### `agent -m` Does NOT Test Sandbox
+
+`openclaw agent -m "Run skill"` runs in the **main session** (on host, full access). It does NOT test sandbox behavior. It bypasses:
+1. `exec-approvals` allowlist path resolution inside Docker
+2. Workspace read-only enforcement
+3. Tool restrictions (`sessions_spawn` denied in sandbox)
+4. Docker image availability
+
+To test sandbox behavior: trigger a cron job (`openclaw cron run <id>`) and check its session log, or use `openclaw sandbox explain` to verify config. `agent -m` is a reasoning test, not an integration test.
+
+**Testing flow:** LOCAL `agent -m` (reasoning) → DEV `cron run` (sandbox integration) → PROD cron schedule (live).
+
+### Exec-Approvals Paths Inside Docker
+
+`exec-approvals.json` uses absolute paths (e.g., `/usr/bin/curl`). Inside the Docker sandbox, binaries may be at different paths than on the host. The allowlist silently denies if the path doesn't match inside the container.
+
+**Fix:** Verify paths inside the sandbox: `docker run --rm openclaw-sandbox:bookworm-slim which curl`. If host and container paths differ, use the container path in `exec-approvals.json`. Also verify the exec-approvals socket path is accessible from inside the container.
+
+### Telegram IPv6 / autoSelectFamily Issue
+
+OpenClaw 2026.3.24+ with Node.js 24 defaults `autoSelectFamily=true`. Droplets without public IPv6 (only link-local `fe80::`) cause the Telegram plugin to try IPv6 first, timing out with `ETIMEDOUT`/`ENETUNREACH`.
+
+**Fix:** `openclaw config set channels.telegram.network.autoSelectFamily false`
+
+Also available as env var: `OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1`. The `--dns-result-order=ipv4first` NODE_OPTIONS flag does NOT fix this — `autoSelectFamily` operates at the socket level, not DNS.
+
+**Check:** `ip -6 addr show scope global` — if empty, set `autoSelectFamily=false`.
+
+### Gateway `.env` Baking
+
+`openclaw gateway install` bakes `.env` values into the systemd service unit file at install time. Changing `.env` alone has no effect on the running gateway.
+
+**After `.env` changes:**
+1. Export the new vars in your shell
+2. Run `openclaw gateway install --force`
+3. `systemctl daemon-reload`
+4. Restart the gateway
+
+Without steps 2-3, the gateway continues using the old baked values.
 
 ---
 

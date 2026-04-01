@@ -11,6 +11,8 @@ Deploy a Premium AMD Droplet (4 GB RAM / 2 vCPU, ~$24/mo) with Ubuntu 24.04. Sel
 
 **1.2 — Create a Non-Root Service User**
 
+> **CRITICAL: Order of operations matters.** Configure passwordless sudo and VERIFY it works BEFORE disabling root SSH. If you disable root login first and sudo doesn't work, you are locked out. Recovery requires: DigitalOcean dashboard → Access → Reset Root Password (reboots droplet) → Launch Recovery Console (VNC-based, bypasses SSH entirely) → fix sudoers. The web-based Droplet Console will NOT work because it uses SSH, which you just locked down.
+
 ```bash
 ssh root@YOUR_DROPLET_IP
 adduser clawuser
@@ -20,6 +22,14 @@ mkdir -p /home/clawuser/.ssh
 cp /root/.ssh/authorized_keys /home/clawuser/.ssh/
 chown -R clawuser:clawuser /home/clawuser/.ssh
 chmod 700 /home/clawuser/.ssh && chmod 600 /home/clawuser/.ssh/authorized_keys
+
+# Configure passwordless sudo for clawuser
+echo "clawuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/clawuser
+chmod 440 /etc/sudoers.d/clawuser
+
+# VERIFY sudo works before proceeding (from a new SSH session as clawuser)
+# ssh clawuser@YOUR_DROPLET_IP "sudo -n whoami"
+# Must return "root". If not, DO NOT proceed to 1.3.
 ```
 
 **1.3 — Lock Down SSH**
@@ -37,10 +47,19 @@ Then restart: `sudo systemctl restart sshd`
 ```bash
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
-sudo ufw limit 22/tcp       # SSH with rate limiting
+sudo ufw limit 22/tcp       # SSH with rate limiting (6 connections/30s per IP)
 # Do NOT open port 18789 — access via SSH tunnel only
 sudo ufw enable
 ```
+
+> **Deploy script gotcha:** `ufw limit` drops connections from IPs exceeding 6 new connections in 30 seconds. Bootstrap or deploy scripts that make many sequential SSH/SCP/rsync calls will be blocked. Use SSH ControlMaster to multiplex over a single connection:
+> ```
+> # ~/.ssh/config (on your local machine)
+> Host YOUR_DROPLET_IP
+>   ControlMaster auto
+>   ControlPath /tmp/ssh-%r@%h
+>   ControlPersist 60
+> ```
 
 **1.5 — Enable Automatic Security Updates**
 
@@ -826,6 +845,8 @@ Merge the following into your `~/.openclaw/openclaw.json` (alongside the gateway
 
 > **Config hot-reload:** The Gateway watches `openclaw.json` for changes. Most config updates apply live without restarting the daemon — including channel settings, tool policies, model selection, and skill configuration. **Exceptions that require a restart:** `gateway.mode`, `gateway.port`, and `sandbox.docker.image` changes require `openclaw gateway restart` to take effect.
 
+> **Never hand-edit `openclaw.json`.** OpenClaw tracks config metadata internally. Hand-editing breaks metadata tracking, causing "Config observe anomaly: missing-meta-vs-last-good" errors and gateway restarts. Always use `openclaw config set <path> <value>`. If config is corrupted: stop gateway, delete the profile dir, re-run `openclaw setup`, then `openclaw config set` for each value.
+
 > **Write access asymmetry (important):** The main session (operator Telegram DM) runs on host and has `write`/`edit` tools available — the agent CAN modify workspace files (skills, memory, SYSTEM_LOG.md) when instructed by the operator. Sandboxed sessions (WhatsApp group, CRON) CANNOT modify workspace files (`workspaceAccess: "ro"` hard enforcement). SOUL.md contains self-modification rules that constrain when the agent should use its write access.
 
 **3.8b — Create the DEV Gateway Config**
@@ -1028,6 +1049,10 @@ chmod 600 ~/.openclaw/.env
 ```
 
 > **Security:** The `.env` file has `chmod 600` — only `clawuser` can read it. Never commit it to git (it's in `.gitignore`). Never reference it in workspace files. The Gateway auto-loads it on startup.
+
+> **Remote .env creation gotcha:** If creating `.env` on a remote droplet via SSH heredoc, do NOT use `$(command)` substitution — it evaluates on your local machine, not the droplet. Use explicit values instead. Example: `$(openssl rand -hex 32)` in a heredoc sent via SSH will generate the token locally and bake the result into the file, which works — but if the heredoc is quoted wrong, the variable expands to empty. Always verify `.env` values after writing remotely: `ssh clawuser@DROPLET "cat ~/.openclaw/.env | grep -c '=.\+'` (should match the number of entries).
+
+> **Gateway and .env:** `openclaw gateway install` bakes `.env` values into the systemd service unit file at install time. After changing `.env` values: (1) export the new vars in your shell, (2) run `openclaw gateway install --force`, (3) `systemctl daemon-reload`, (4) restart the gateway. Without `--force` + `daemon-reload`, the gateway uses the old baked values.
 
 **3.13 — Configure Claude Code Workspace Permissions**
 
@@ -1435,7 +1460,7 @@ Add your own CRON jobs for domain-specific skills:
 
 > **IMPORTANT: Set `delivery.mode: "none"` on ALL cron jobs.** Without this, cron output auto-delivers to the main session's last active channel. If the operator's last message was in a customer DM, cron output leaks to that customer. After registering each job:
 > ```bash
-> openclaw cron edit <id> --params '{"delivery": {"mode": "none"}}'
+> openclaw cron edit <id> --delivery-mode none
 > ```
 >
 > **`systemEvent` vs `agentTurn`:** Shell-script-only jobs (backups, checkpoints, file initialization) should use `systemEvent` on the main session — no LLM invocation needed. Jobs requiring LLM reasoning use `agentTurn` with `sessionTarget: "isolated"`. See `reference-openclaw-design-patterns.md` Section 4 for details.
@@ -1623,9 +1648,9 @@ grep -A 5 '"sandbox"' ~/.openclaw/openclaw.json | grep -A 5 '"tools"'
 # Must show cron, sessions_spawn in deny list
 
 # 26. Verify delivery.mode on all cron jobs
-openclaw cron list --json | jq '.[].delivery.mode'
+openclaw cron list --json | jq '.jobs[].delivery.mode'
 # Every job must show "none". If any show null or "announce", fix with:
-# openclaw cron edit <id> --params '{"delivery": {"mode": "none"}}'
+# openclaw cron edit <id> --delivery-mode none
 
 # 27. Verify sandbox tool allowlist matches skill requirements
 openclaw sandbox explain
