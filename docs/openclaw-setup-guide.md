@@ -592,6 +592,7 @@ Run these checks immediately after the gateway starts or restarts:
 - Process domain operations or send customer-facing messages during boot checks.
 - Modify any files, sheets, or cron jobs.
 - Skip checks — always run all 5 steps even if the gateway restarted cleanly.
+- **Include tool calls that depend on external services (network, APIs).** If any boot-time tool call fails (service not ready, network timeout), the failure context pollutes the session and can cause the agent to stop calling tools for all subsequent requests in that session. Move connectivity-dependent startup checks to HEARTBEAT.md's "On Startup" section instead. Keep BOOT.md limited to local file reads and `openclaw` CLI commands.
 ```
 
 **3.9 — MEMORY.md (Long-Term Agent Memory)**
@@ -742,7 +743,12 @@ Merge the following into your `~/.openclaw/openclaw.json` (alongside the gateway
   "cron": {
     "enabled": true,
     "maxConcurrentRuns": 2,
-    "sessionRetention": "24h"
+    "sessionRetention": "4h"
+  },
+  "session": {
+    "maintenance": {
+      "mode": "enforce"
+    }
   },
   "channels": {
     "whatsapp": {
@@ -822,9 +828,9 @@ Merge the following into your `~/.openclaw/openclaw.json` (alongside the gateway
 - **`channels.whatsapp.selfChatMode: true`** — Enables testing by messaging yourself on WhatsApp.
 - **`channels.telegram.botToken: "${TELEGRAM_BOT_TOKEN}"`** — Env var interpolation for the Telegram bot token.
 - **`channels.telegram.groupPolicy: "disabled"`** — Telegram is the operator-only channel. Group messages are explicitly disabled to prevent accidental exposure.
-- **`session.dmScope: "per-channel-peer"`** — Isolates DM sessions per sender per channel. The operator's Telegram DM, the operator's WhatsApp DM, and each customer's group session all get separate contexts. Prevents cross-session data leakage.
+- **`session.dmScope: "per-channel-peer"`** — Isolates DM sessions per sender per channel. The operator's Telegram DM, the operator's WhatsApp DM, and each customer's group session all get separate contexts. Prevents cross-session data leakage. **Caution:** Combined with `sandbox.mode: "non-main"`, DM sessions become sandboxed and lose host-level tool access. For single-operator setups where the operator needs full tool access from DMs, remove `dmScope` so DMs route to the unsandboxed main session.
 - **`agents.defaults.model`** — Sets Claude Sonnet 4.6 as the primary model with Gemini 2.5 Pro as fallback. **Important:** OpenClaw uses Anthropic API keys (`sk-ant-xxxxx` format from console.anthropic.com), not OAuth tokens from claude.ai subscriptions. Claude Pro/Max/Team subscriptions cannot be used with third-party tools — you need a separate API key with Console billing.
-- **`agents.defaults.models`** — Model roster: additional models available for manual switching via `/model` command.
+- **`agents.defaults.models`** — Model roster: additional models available for manual switching via `/model` command. **Tip:** If the agent must call tools from messaging channel turns (Telegram, WhatsApp), set `params.thinking: "high"` on the primary model. Without extended thinking, single-inference turns may produce text-only responses with no tool calls.
 - **`agents.defaults.maxConcurrent` + `subagents.maxConcurrent`** — Limits concurrent agent turns (4) and subagent spawns (8) to prevent runaway resource usage on a 4 GB Droplet.
 - **`agents.list`** — Defines the main agent with `mentionPatterns` for WhatsApp group @mentions. Plain text patterns (case-insensitive) since WhatsApp native @mentions don't work for bots.
 - **`tools.deny`** — Gateway-level deny-list. `process` replaces the old `exec` entry (process management is denied). `browser` is denied as a single entry (covers all browser tools). All email/gmail/SSH/gateway tools are denied. Note: `exec` is NOT in this list — exec is enabled but scoped via `exec-approvals.json`.
@@ -836,6 +842,8 @@ Merge the following into your `~/.openclaw/openclaw.json` (alongside the gateway
 - **`sandbox.mode: "non-main"`** — Runs group chat and thread sessions inside isolated Docker containers. Main DM sessions (your direct operator channel) run on host for full tool access.
 - **`sandbox.workspaceAccess: "ro"`** — The sandbox mounts the workspace read-only. Group sessions can read skills and workspace files for context but CANNOT modify them. This prevents prompt injection from modifying skills, SOUL.md, or other workspace files via group chat. The agent can still write to Google Sheets (gog is an API call, not a filesystem operation).
 - **`sandbox.docker`** — Container hardening: read-only root filesystem, 512 MB memory limit, 128 PID limit. Prevents container escape and resource exhaustion.
+- **`cron.sessionRetention: "4h"`** — Sandbox containers from cron runs are retained for 4 hours, then cleaned up. The default (`"24h"`) causes container buildup on deployments with frequent cron jobs — one production deployment accumulated 106 orphaned containers. Use `"4h"` unless you need longer session logs for debugging.
+- **`session.maintenance.mode: "enforce"`** — Enables automatic cleanup of stale sessions and their sandbox containers. Without this, abandoned containers accumulate indefinitely.
 - **`compaction.mode: "safeguard"`** — Enables automatic context compaction. When sessions approach the context window limit, OpenClaw summarizes oldest turns and saves facts to `memory/YYYY-MM-DD.md` files. Use `/compact` manually when sessions feel sluggish.
 - **`heartbeat.target: "telegram"`** — Sends heartbeat alerts to your Telegram operator channel.
 - **`skills.load.watch: true`** — Enables the skill file watcher. When you edit a SKILL.md, OpenClaw detects the change and refreshes the skills snapshot on the next agent turn — no gateway restart needed.
@@ -899,6 +907,14 @@ sg docker -c "cd ~/.openclaw && bash scripts/sandbox-setup.sh"
 > **Note:** `sg docker -c "..."` runs the command with Docker group permissions in the current session. Do NOT use `newgrp docker` — it opens a new shell that won't persist across subsequent commands. After this session, the group membership takes effect on next login.
 
 > **IMPORTANT:** The base `debian:bookworm-slim` image has **no `curl`**. If your skills use `exec curl` from sandbox sessions, you must add `curl` to the sandbox Dockerfile. Without it, skills will fail silently — the `exec curl` command produces no output and no error.
+
+> **Sandbox env var forwarding:** Sandbox containers do NOT inherit the host process environment. To make env vars available inside the sandbox, add them to `agents.defaults.sandbox.docker.env` in `openclaw.json` using SecretRef syntax: `"DATABASE_URL": "${DATABASE_URL}"`. Without this, `exec curl` with auth headers and database-dependent logic will fail silently from cron/sandbox sessions.
+
+> **Docker sensitive var filter:** Docker sandbox blocks env vars with `KEY`, `SECRET`, `TOKEN`, or `PASSWORD` in their names — even when explicitly listed in `sandbox.docker.env`. Use the internal API endpoint pattern (see design patterns reference Section 11) to pass secrets server-side instead of forwarding them to sandbox.
+
+> **`strictInlineEval`:** OpenClaw blocks interpreter eval forms (`node -e`, `python -c`, `bash -c`) even when the binary is in the exec allowlist. This is controlled by `tools.exec.strictInlineEval` (default: `true`). Use `exec curl` to call API endpoints or `exec printenv VAR_NAME` to read env vars. Do not use `echo $VAR` in sandbox — shell expansion does not work; `exec echo $VAR` returns the literal string `$VAR`.
+
+> **Sandbox workspace snapshot scope:** Sandbox sessions only receive core identity files (`SOUL.md`, `AGENTS.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`) and the `skills/` directory. Custom root-level workspace files are NOT available. Use the memory system (`memory_search`/`memory_get`) for cross-run state persistence from sandbox.
 
 Verify the image was built: `docker images | grep openclaw-sandbox`
 
@@ -1463,7 +1479,11 @@ Add your own CRON jobs for domain-specific skills:
 > openclaw cron edit <id> --delivery-mode none
 > ```
 >
-> **`systemEvent` vs `agentTurn`:** Shell-script-only jobs (backups, checkpoints, file initialization) should use `systemEvent` on the main session — no LLM invocation needed. Jobs requiring LLM reasoning use `agentTurn` with `sessionTarget: "isolated"`. See `reference-openclaw-design-patterns.md` Section 4 for details.
+> **`systemEvent` vs `agentTurn`:** Shell-script-only jobs (backups, checkpoints, file initialization) should use `systemEvent` on the main session — no LLM invocation needed. Jobs requiring LLM reasoning use `agentTurn` with `sessionTarget: "isolated"`. See `reference-openclaw-design-patterns.md` Section 4 for details. **Note (v2026.4.1+):** `systemEvent` payloads are now wrapped in a relay frame that causes the model to relay instead of execute. Use system crontab for deterministic shell ops; reserve OpenClaw cron for agent-reasoning tasks.
+>
+> **Delivery channel syntax:** Use `--channel telegram --to <chatId>`, not a combined format like `--channel telegram:dm:<chatId>`. The combined format fails to resolve on delivery. The `--to` field provides session context even with delivery disabled.
+>
+> **Telegram message limits:** Telegram enforces a 4096 character limit per message. Skills that produce long output (reports, lists) must instruct the agent to split into multiple messages. The `message` tool target must be `telegram:<chatId>` (e.g., `telegram:5906288273`), not a symbolic name like "operator".
 
 > **CRON Payload Cache Sync** — CRON job payloads are static: the `--message` or `--command` text is captured at registration time. Editing a skill file or script does NOT update the CRON payload. When you edit a skill that has a corresponding CRON job with inline instructions:
 > 1. Edit the skill file
@@ -1728,6 +1748,26 @@ openclaw sandbox explain
 - Rebuild the memory index: `openclaw memory reindex`
 - Verify memory files exist: `ls ~/.openclaw/workspace/memory/`
 - Check if the SQLite index is corrupted: `sqlite3 ~/.openclaw/workspace/memory/*.sqlite "PRAGMA integrity_check;"`
+- `memory_search` FTS misses on compound queries. Use broad single-anchor queries (e.g., `"PENDING_IDEAS"` not `"PENDING_IDEAS SignalMidway"`).
+
+**Agent produces text but no tool calls:**
+- Check `params.thinking` in model config — set to `"high"` for agents that must call tools from messaging channels (Telegram, WhatsApp). Without extended thinking, single-inference turns produce text-only responses.
+- Check conversation history — if the session has 20+ failed tool attempts, the model learns to avoid tools. Fix: delete the session and restart the gateway to create a fresh session.
+- Check for dispatch templates in AGENTS.md — step-by-step templates cause the model to pattern-match and generate expected output text instead of executing tools. List skill names and SKILL.md paths only.
+
+**Sandbox exec denied for allowlisted binary:**
+- Check `tools.exec.strictInlineEval` — default `true` blocks `node -e`, `python -c`, `bash -c` even when the binary is in exec-approvals. Use `exec curl` to call API endpoints instead.
+- Check `autoAllowSkills` in exec-approvals.json — if `false` (default), binaries in skill frontmatter `requires.bins` trigger socket approval, time out at 120s, and deny in cron/sandbox sessions.
+- Verify binary paths inside Docker: `docker run --rm openclaw-sandbox:bookworm-slim which <binary>`. Host and container paths may differ.
+- Check exec-approvals pattern matching: include both full path (`/usr/bin/curl`) AND bare name (`curl`) patterns.
+
+**Cron jobs fail after OpenClaw update:**
+- After `openclaw update`, systemd service files still reference the old version. Run `openclaw --profile $NAME gateway install --force` for each profile, then `systemctl --user daemon-reload`, then restart. Wait 15-20s for warmup before verifying.
+- Re-verify exec-approvals: `openclaw approvals get --gateway --timeout 30000`
+
+**Skills not taking effect after deploy:**
+- Workspace file changes (SOUL.md, AGENTS.md, skills) are not picked up by existing sessions. The gateway reuses sessions from the session store.
+- After major instruction changes: restart the gateway AND delete the relevant session entry from `sessions.json`, then restart again.
 
 ---
 
@@ -1744,6 +1784,8 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - Verify email isolation holds: `grep '"email_send"' ~/.openclaw/openclaw.json` (must be in deny list).
 - Audit approved pairings: `openclaw pairing list --approved whatsapp` and `openclaw pairing list --approved telegram`. Remove any unrecognized contacts. Note: previously approved pairings persist in `~/.openclaw/credentials/` and survive config changes.
 - Review session logs for denied tool attempts: `grep -r "email_send\|exec\|gateway_config" ~/.openclaw/agents/*/sessions/` — any hits indicate injection attempts.
+- Review session count and container buildup: `openclaw session list` — verify session maintenance is cleaning up stale containers. If counts grow, check `session.maintenance.mode` is `"enforce"` and `cron.sessionRetention` is `"4h"`.
+- DEV/PROD parity check: `diff <(openclaw --profile prod config get .) <(openclaw --profile dev config get .)` — structural differences (beyond workspace path and channels) are bugs.
 
 **Monthly:**
 - Run a security audit: `openclaw security audit --deep`
@@ -1754,6 +1796,7 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - Review and prune workspace files — remove stale skills, outdated data, and old logs.
 - Check that `SOUL.md` and `AGENTS.md` still reflect current needs. Skill descriptions may need updating as your domain evolves.
 - Verify Claude Code is up to date: `claude update` or check auto-update is working.
+- **OpenClaw upgrade ceremony:** After `openclaw update`: (1) `openclaw --profile $NAME gateway install --force` for each profile, (2) `systemctl --user daemon-reload`, (3) restart gateways, (4) wait 15-20s, (5) verify health + exec-approvals for each profile. Systemd service files bake the binary path — without reinstalling, the old version keeps running.
 
 **Quarterly:**
 - Rotate GitHub deploy keys: generate a new key, update the deploy key in GitHub settings, remove the old one.
@@ -1846,7 +1889,8 @@ When you need to update skills — new data schemas, changed workflows, seasonal
 | **Workspace write (sandbox)** | **`sandbox.workspaceAccess: "ro"`** | **Execution** | **WhatsApp group CANNOT modify workspace files (hard enforcement — write/edit/apply_patch disabled)** |
 | **Skill routing / selection** | **`description` field in SKILL.md frontmatter (~97 chars)** | **Execution** | **Gateway matches user request against skill index; full SKILL.md injected on match** |
 | **Skill hot-reload** | **`openclaw.json` → `skills.load.watch: true`** | **Execution** | **Skill changes picked up on next agent turn without restart** |
-| **CRON configuration** | **`openclaw.json` → `cron.enabled`, `maxConcurrentRuns`, `sessionRetention`** | **Execution** | **CRON jobs enabled with 2-job concurrency limit and 24h retention** |
+| **CRON configuration** | **`openclaw.json` → `cron.enabled`, `maxConcurrentRuns`, `sessionRetention`** | **Execution** | **CRON jobs enabled with 2-job concurrency limit and 4h retention** |
+| **Session maintenance** | **`openclaw.json` → `session.maintenance.mode`** | **Execution** | **Automatic cleanup of stale sessions and sandbox containers** |
 | **Self-modification rules** | **`SOUL.md` → Self-Modification Rules** | **Reasoning** | **Agent must get operator confirmation before modifying skills; must not modify SOUL.md/AGENTS.md/TOOLS.md** |
 | **Hourly workspace checkpoints** | **`hourly-checkpoint` CRON job** | **Backup** | **Git commits workspace changes every hour — enables per-hour rollback of skill edits and memory** |
 | **Context window management** | **`openclaw.json` → `compaction`** | **Execution** | **Prevents session crashes on long runs** |

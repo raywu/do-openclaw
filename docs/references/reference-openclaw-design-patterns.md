@@ -602,6 +602,9 @@ Production-discovered mistakes that cause silent failures or data leaks:
 | Hand-editing `openclaw.json` | Breaks internal config metadata tracking | Gateway restart loop with "missing-meta-vs-last-good" error |
 | Testing skills with `agent -m` only | Runs in main session, not sandbox | Misses exec-approvals, workspace ro, Docker, tool restrictions |
 | `$(command)` in heredocs sent via SSH | Evaluates on local machine, not droplet | Empty .env values, gateway crash-loops |
+| Tool calls in BOOT.md depending on external services | Boot-time tool failures poison the session — model stops calling tools for all subsequent requests | Agent enters "degraded mode" for entire session lifetime |
+| Step-by-step dispatch templates in AGENTS.md | LLM pattern-matches the template structure and generates expected output text instead of executing tools | Agent produces formatted text describing what it would do instead of calling tools |
+| DEV config diverging from PROD structure | Partial DEV config tests a different system — bugs pass DEV, fail PROD | `diff <(openclaw --profile prod config get .) <(openclaw --profile dev config get .)` to catch drift |
 
 ---
 
@@ -708,40 +711,15 @@ Cron payloads are **static** — captured at registration time. Editing a SKILL.
 
 Hard-won lessons from production debugging. Each entry caused a real incident or wasted significant debugging time.
 
-### PATH Issues in Cron Scripts
+### Sandbox & Exec Isolation
 
-Scripts invoked by OpenClaw cron jobs (`systemEvent`) run in a minimal shell environment. The `openclaw` binary (installed via npm) may not be on `$PATH`.
+#### Exec-Approvals Paths Inside Docker
 
-**Fix:** All cron-invoked scripts should:
-1. Export the npm global bin directory to PATH: `export PATH="$HOME/.npm-global/bin:$PATH"`
-2. Use an `$OPENCLAW` env var (defaulting to `openclaw`) for CLI invocation
-3. Derive workspace paths dynamically from `$(dirname "$0")/..` rather than hardcoding
+`exec-approvals.json` uses absolute paths (e.g., `/usr/bin/curl`). Inside the Docker sandbox, binaries may be at different paths than on the host. The allowlist silently denies if the path doesn't match inside the container.
 
-### Delivery Mode Leaks
+**Fix:** Verify paths inside the sandbox: `docker run --rm openclaw-sandbox:bookworm-slim which curl`. If host and container paths differ, use the container path in `exec-approvals.json`. Also verify the exec-approvals socket path is accessible from inside the container.
 
-The `delivery.mode: "announce"` setting on cron jobs sends the agent's final output to the configured channel. If the agent includes internal notes, debug info, or operator-only context in its output, that content leaks to the delivery channel.
-
-**Rule:** Skills with `delivery.mode: "announce"` must structure their output so only the customer-facing message appears. Internal summaries go to the operator channel via explicit `message` tool calls, not as part of the agent's conversational output. Better yet, use `delivery.mode: "none"` on all crons (see Section 4 Rule 7).
-
-### `sessions_send` Auto-Delivery Leak
-
-`sessions_send` to `agent:main:main` for customer DM delivery is dangerous. The main session's auto-delivery context routes responses to whatever channel was most recently active. If a customer DM session is active, ALL main session output — including internal reasoning, cron summaries, and debug text — auto-delivers to that customer.
-
-**Root cause:** Main session output routing is non-deterministic. Multiple fix attempts (session key format, stronger SOUL.md instructions) fail because the routing depends on gateway state, not agent reasoning.
-
-**Final fix pattern:** Server-side DM delivery. The internal API server calls `openclaw message send` CLI directly (via process execution) to deliver DMs through the gateway, bypassing agent sessions entirely. Skills return structured action objects (`{type: "[CHANNEL]_dm", phone, message}`) instead of sending messages themselves.
-
-**Rule:** Never use `sessions_send` for customer-facing message delivery. `sessions_send` is still valid for internal delegation (memory writes, data reads, sheet updates).
-
-### Port Fixup for Multi-Environment Skills
-
-When skills hardcode `localhost:[PORT]` for internal API calls, and DEV/PROD servers run on different ports (e.g., PROD on `:3000`, DEV on `:3001`), promotion scripts need port fixup.
-
-**Pattern:** `promote-dev.sh` runs sed to replace `:3000` → `:3001` in skill files. `promote.sh` reverses the replacement for PROD.
-
-**Gotcha:** The fixup sed must exclude the promotion scripts themselves — otherwise it rewrites the sed patterns inside `promote*.sh`, turning `s|3001|3000|` into `s|3001|3001|` (a no-op). Use `find -not -name 'promote*.sh'` in the fixup command.
-
-### `agent -m` Does NOT Test Sandbox
+#### `agent -m` Does NOT Test Sandbox
 
 `openclaw agent -m "Run skill"` runs in the **main session** (on host, full access). It does NOT test sandbox behavior. It bypasses:
 1. `exec-approvals` allowlist path resolution inside Docker
@@ -753,13 +731,193 @@ To test sandbox behavior: trigger a cron job (`openclaw cron run <id>`) and chec
 
 **Testing flow:** LOCAL `agent -m` (reasoning) → DEV `cron run` (sandbox integration) → PROD cron schedule (live).
 
-### Exec-Approvals Paths Inside Docker
+#### `exec curl` — LLMs Describe Instead of Emitting
 
-`exec-approvals.json` uses absolute paths (e.g., `/usr/bin/curl`). Inside the Docker sandbox, binaries may be at different paths than on the host. The allowlist silently denies if the path doesn't match inside the container.
+Sandbox sessions cannot make HTTP calls via high-level constructs (e.g., "POST to localhost:3000"). The LLM must emit `exec curl` explicitly. Smaller models (Codex, GPT-5.1) tend to describe the HTTP call in prose rather than writing the actual `exec curl` command.
 
-**Fix:** Verify paths inside the sandbox: `docker run --rm openclaw-sandbox:bookworm-slim which curl`. If host and container paths differ, use the container path in `exec-approvals.json`. Also verify the exec-approvals socket path is accessible from inside the container.
+**Fix:** All SKILL.md files should include the literal `exec curl` command in the workflow steps. The skill body serves as the authoritative instruction — the agent copies the command verbatim rather than improvising.
 
-### Telegram IPv6 / autoSelectFamily Issue
+**Pattern:**
+```markdown
+## Workflow
+1. Run: exec curl -sf -X POST http://localhost:[PORT]/api/internal/[ENDPOINT] -H "Content-Type: application/json"
+```
+
+**Why `-sf`:** `-s` (silent) suppresses progress bars; `-f` (fail) returns non-zero on HTTP errors so the agent sees the failure. Always use both.
+
+#### Sandbox Env Var Forwarding
+
+Sandbox containers do NOT inherit the host process environment. Environment variables must be explicitly forwarded via `agents.defaults.sandbox.docker.env` in `openclaw.json`. Use SecretRef syntax (`${VAR_NAME}`) to reference gateway env vars.
+
+**Impact:** Without this config, `exec curl` with auth headers and any database-dependent logic will fail silently or return auth errors from sandbox/cron sessions.
+
+**Fix:** Add all required env vars to `sandbox.docker.env`:
+```json
+"agents": {
+  "defaults": {
+    "sandbox": {
+      "docker": {
+        "env": {
+          "DATABASE_URL": "${DATABASE_URL}",
+          "APP_URL": "${APP_URL}"
+        }
+      }
+    }
+  }
+}
+```
+
+#### Docker Sensitive Var Filter
+
+Docker sandbox blocks environment variables with `KEY`, `SECRET`, `TOKEN`, or `PASSWORD` in their names — even when explicitly listed in `sandbox.docker.env`.
+
+**Workaround:** Use the internal API endpoint pattern (Section 11). The sandbox calls REST APIs via `exec curl`, and the API server handles authenticated operations server-side with its own env vars. The sandbox only needs non-sensitive env vars (URLs, user IDs) and a single write credential (e.g., `AGENT_WRITE_CRED` — "CRED" does not trigger the filter).
+
+**Rule:** Don't rename env vars to bypass the filter (e.g., `API_KEY` → `API_CRED1`). This makes config unreadable. Build API endpoints instead.
+
+#### Shell Expansion in Sandbox
+
+Sandbox `exec` does NOT expand shell variables. `exec echo $VAR` returns the literal string `$VAR`, not the value.
+
+**Fix:** Use `exec printenv VAR_NAME` to read environment variables in sandbox. `printenv` reads directly from the process environment without shell expansion.
+
+**Do NOT use:**
+- `echo $VAR` (returns literal `$VAR`)
+- `bash -c "echo $VAR"` (not in exec allowlist)
+- `${VAR}` in curl args (causes "Bad hostname")
+
+#### `strictInlineEval` Blocks Inline Code Execution
+
+OpenClaw has `tools.exec.strictInlineEval` (default: `true`) which blocks interpreter eval forms (`node -e`, `python -c`, `bash -c`) even when the binary is allowlisted in exec-approvals. This is a security feature to prevent arbitrary code execution.
+
+**Workaround:** Use the API endpoint pattern — the agent calls REST APIs via `exec curl`, and the server handles complex operations. For simple reads, use `exec printenv` for env vars or `exec cat` for files. If `node -e` is essential, set `strictInlineEval: false` (weakens security) or write to a temp script file and execute it.
+
+#### Sandbox Workspace Snapshot Scope
+
+Sandbox sessions only receive a snapshot of core identity files (`SOUL.md`, `AGENTS.md`, `TOOLS.md`, `USER.md`, `IDENTITY.md`, `HEARTBEAT.md`) and the `skills/` directory. Custom root-level workspace files are NOT available in sandbox sessions.
+
+**Impact:** Files like custom config dumps, blacklists, or data files placed at the workspace root will not be accessible from cron/sandbox sessions.
+
+**Fix:** Use the OpenClaw memory system (`memory_search`/`memory_get`) for cross-run state persistence from sandbox. Place data that sandbox sessions need inside `skills/` subdirectories or the `memory/` directory (indexed by the memory system).
+
+#### `autoAllowSkills` for Skill Bin Execution
+
+Without `autoAllowSkills: true` in `exec-approvals.json`, binaries listed in a skill's frontmatter `requires.bins` trigger socket-based approval. Since there's no approval listener in cron/sandbox sessions, the request times out at 120s and denies.
+
+**Fix:** Set `autoAllowSkills: true` in `exec-approvals.json` if skills declare required binaries. This auto-approves bins declared in skill frontmatter without socket confirmation.
+
+**Tradeoff:** `false` is more restrictive (manual allowlist only); `true` trusts skill frontmatter declarations.
+
+### Session & Model Behavior
+
+#### LLM Hallucinated API Responses
+
+When `exec` is denied (allowlist miss), the agent can fabricate a plausible API response — including realistic HTTP status codes, UUIDs, and success messages. The agent reports "201 Created" with a UUID that looks real but doesn't exist in the data store.
+
+**Fix:** Add explicit verification steps in SKILL.md: after any write operation, independently confirm the write succeeded by reading back from the data store. Do not trust the agent's reported HTTP status alone.
+
+#### `memory_search` FTS Limitations
+
+OpenClaw's `memory_search` full-text search misses on compound/multi-word queries. `memory_search("PENDING_IDEAS SignalMidway")` returns empty, but `memory_search("PENDING_IDEAS")` returns the chunk containing "SignalMidway".
+
+**Fix:** Always use broad single-anchor queries and filter results client-side. Never append entity names or secondary terms to the search query.
+
+#### `sessions_send` Partial Processing
+
+Multi-section payloads sent via `sessions_send` may be partially processed. When a single `sessions_send` call includes instructions to write multiple data sections, the receiving session may act on one section and skip others.
+
+**Fix:** Split `sessions_send` into separate calls — one per write intent. Each call should be one atomic operation. If combining is unavoidable, put the most important section first.
+
+#### `thinking:high` for Tool Calls on Messaging Channels
+
+Without extended thinking enabled (`params.thinking: "high"` or equivalent in model config), messaging channel turns (Telegram, WhatsApp) may produce text-only responses with no tool calls. The model generates text tokens first, and the single-inference turn ends before tools execute.
+
+**Fix:** Set `params.thinking: "high"` on the model config for agents that must call tools from messaging channel turns. This forces the model to reason before generating, enabling multi-step tool chains in a single turn.
+
+**Tradeoff:** Thinking adds reasoning overhead. Cron jobs with `thinking:high` may need increased timeouts (e.g., 900s instead of 300s).
+
+#### Conversation History Pollution
+
+After many failed tool attempts accumulate in a session (28+ in one observed case), the model learns a "generate text, don't call tools" pattern and stops calling tools entirely — even with explicit instructions.
+
+**Fix:** Delete the polluted session and restart the gateway to create a fresh session. Prevention: fix tool failures early (don't let them accumulate), and configure session maintenance to auto-clear stale sessions.
+
+### Delivery & Messaging
+
+#### Delivery Mode Leaks
+
+The `delivery.mode: "announce"` setting on cron jobs sends the agent's final output to the configured channel. If the agent includes internal notes, debug info, or operator-only context in its output, that content leaks to the delivery channel.
+
+**Rule:** Skills with `delivery.mode: "announce"` must structure their output so only the customer-facing message appears. Internal summaries go to the operator channel via explicit `message` tool calls, not as part of the agent's conversational output. Better yet, use `delivery.mode: "none"` on all crons (see Section 4 Rule 7).
+
+#### `sessions_send` Auto-Delivery Leak
+
+`sessions_send` to `agent:main:main` for customer DM delivery is dangerous. The main session's auto-delivery context routes responses to whatever channel was most recently active. If a customer DM session is active, ALL main session output — including internal reasoning, cron summaries, and debug text — auto-delivers to that customer.
+
+**Root cause:** Main session output routing is non-deterministic. Multiple fix attempts (session key format, stronger SOUL.md instructions) fail because the routing depends on gateway state, not agent reasoning.
+
+**Final fix pattern:** Server-side DM delivery. The internal API server calls `openclaw message send` CLI directly (via process execution) to deliver DMs through the gateway, bypassing agent sessions entirely. Skills return structured action objects (`{type: "[CHANNEL]_dm", phone, message}`) instead of sending messages themselves.
+
+**Rule:** Never use `sessions_send` for customer-facing message delivery. `sessions_send` is still valid for internal delegation (memory writes, data reads, sheet updates).
+
+#### Cron Delivery Channel Syntax
+
+Use `--channel telegram --to <chatId>` when registering cron jobs, not a combined format like `--channel telegram:dm:<chatId>`. The combined format fails to resolve on delivery.
+
+**Also:** The `--to` field provides Telegram session context even when delivery is disabled (`--delivery-mode none`). Use `--no-deliver` as an alternative to `--delivery-mode none`.
+
+#### Telegram Message Length Limits
+
+Telegram enforces a 4096 character limit per message. Skills that produce long output (reports, lists, summaries) must instruct the agent to split into multiple messages.
+
+**Also:** The `message` tool target must be `telegram:<chatId>` (e.g., `telegram:5906288273`), not a symbolic name like "operator". Specify the exact tool call format in SKILL.md to prevent the agent from guessing.
+
+### Cron & Scheduling
+
+#### PATH Issues in Cron Scripts
+
+Scripts invoked by OpenClaw cron jobs (`systemEvent`) run in a minimal shell environment. The `openclaw` binary (installed via npm) may not be on `$PATH`.
+
+**Fix:** All cron-invoked scripts should:
+1. Export the npm global bin directory to PATH: `export PATH="$HOME/.npm-global/bin:$PATH"`
+2. Use an `$OPENCLAW` env var (defaulting to `openclaw`) for CLI invocation
+3. Derive workspace paths dynamically from `$(dirname "$0")/..` rather than hardcoding
+
+#### Session Maintenance for Container Buildup
+
+Without session maintenance, sandbox containers from cron and subagent runs accumulate indefinitely. One deployment accumulated 106 orphaned containers on a DEV gateway.
+
+**Fix:** Configure `session.maintenance.mode: "enforce"` and `cron.sessionRetention: "4h"` in `openclaw.json`:
+```json
+"session": {
+  "maintenance": {
+    "mode": "enforce"
+  }
+},
+"cron": {
+  "sessionRetention": "4h"
+}
+```
+
+#### `dmScope` Conflict with Sandbox Non-Main
+
+`session.dmScope: "per-channel-peer"` combined with `sandbox.mode: "non-main"` creates sandboxed DM sessions. DM sessions become non-main, get sandboxed in Docker, and lose access to host-level tools (exec, file writes, full env vars).
+
+**Impact:** For single-operator setups where the operator needs full tool access from Telegram/WhatsApp DMs, this combination silently blocks tool execution.
+
+**Fix:** Remove `dmScope` for single-operator bots so DMs route to the unsandboxed main session. Re-enable `per-channel-peer` only when multi-user support is needed.
+
+### Deployment & Upgrades
+
+#### Port Fixup for Multi-Environment Skills
+
+When skills hardcode `localhost:[PORT]` for internal API calls, and DEV/PROD servers run on different ports (e.g., PROD on `:3000`, DEV on `:3001`), promotion scripts need port fixup.
+
+**Pattern:** `promote-dev.sh` runs sed to replace `:3000` → `:3001` in skill files. `promote.sh` reverses the replacement for PROD.
+
+**Gotcha:** The fixup sed must exclude the promotion scripts themselves — otherwise it rewrites the sed patterns inside `promote*.sh`, turning `s|3001|3000|` into `s|3001|3001|` (a no-op). Use `find -not -name 'promote*.sh'` in the fixup command.
+
+#### Telegram IPv6 / autoSelectFamily Issue
 
 OpenClaw 2026.3.24+ with Node.js 24 defaults `autoSelectFamily=true`. Droplets without public IPv6 (only link-local `fe80::`) cause the Telegram plugin to try IPv6 first, timing out with `ETIMEDOUT`/`ENETUNREACH`.
 
@@ -769,7 +927,7 @@ Also available as env var: `OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1`. The
 
 **Check:** `ip -6 addr show scope global` — if empty, set `autoSelectFamily=false`.
 
-### Gateway `.env` Baking
+#### Gateway `.env` Baking
 
 `openclaw gateway install` bakes `.env` values into the systemd service unit file at install time. Changing `.env` alone has no effect on the running gateway.
 
@@ -779,7 +937,40 @@ Also available as env var: `OPENCLAW_TELEGRAM_DISABLE_AUTO_SELECT_FAMILY=1`. The
 3. `systemctl daemon-reload`
 4. Restart the gateway
 
-Without steps 2-3, the gateway continues using the old baked values.
+Without steps 2-3, the gateway continues using the old baked values. This also means API credential rotations in `.env` are silently ignored until the service is reinstalled.
+
+#### Stale Sessions After Deploy
+
+Workspace file changes (SOUL.md, AGENTS.md, TOOLS.md, skills) are not picked up by existing sessions. The gateway reuses sessions from the session store — it does not recreate them on restart.
+
+**Fix:** After deploying updated workspace files:
+1. Deploy the files
+2. Restart the gateway
+3. If major instruction changes: delete the relevant session entry from `sessions.json` and restart again
+
+Without step 3, the agent continues using cached instructions from the previous session.
+
+#### Upgrade Process (Post-Update Ceremony)
+
+After `openclaw update`, the systemd service files still reference the old version. The gateway continues running the old binary until the service is reinstalled.
+
+**Full upgrade sequence:**
+1. `openclaw update`
+2. `openclaw --profile $NAME gateway install --force` (for each profile)
+3. `systemctl --user daemon-reload`
+4. Restart each gateway service
+5. Wait 15-20s for warmup (v2026.4.1+ needs this before responding to CLI queries)
+6. Verify: `openclaw --profile $NAME approvals get --gateway --timeout 30000`
+
+**Also:** Re-verify exec-approvals after every upgrade — profile isolation bugs may persist across versions.
+
+#### `systemEvent` Relay Regression (v2026.4.1+)
+
+OpenClaw v2026.4.1 introduced "Runtime Event Trust" security hardening (#62003) that reclassifies cron `systemEvent` payloads as untrusted. The gateway wraps them in a relay frame ("Please relay this reminder to the user in a helpful and friendly way"), causing the model to relay instead of execute.
+
+**Impact:** Cron jobs using `systemEvent` for script execution stop working. SOUL.md directives and session resets do NOT override the relay wrapper — the delivery framing wins.
+
+**Fix:** Use system crontab (`crontab -e`) for deterministic shell operations. Reserve OpenClaw cron for agent-reasoning tasks (`agentTurn` with isolated sessions). For agent-aware tasks from system crontab, use `openclaw agent --deliver`.
 
 ---
 

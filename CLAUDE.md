@@ -46,6 +46,15 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **Telegram IPv6**: OpenClaw 2026.3.24+ / Node 24 `autoSelectFamily=true` breaks on droplets without public IPv6; fix: `channels.telegram.network.autoSelectFamily false`
 - **`sessions_send` from isolated cron (v2026.3.8+)**: requires `tools.subagents.tools.alsoAllow: ["sessions_send"]` and `agents.defaults.sandbox.sessionToolsVisibility: "all"` — without both, isolated cron delegation silently fails
 - **Prompt caching**: `cacheRetention: "long"` in `agents.defaults.models` for Anthropic models with >5 min interaction gaps; Anthropic-only feature
+- **Session maintenance**: `session.maintenance.mode: "enforce"` + `cron.sessionRetention: "4h"` to prevent sandbox container buildup
+- **Thinking for tool calls**: `params.thinking: "high"` on model config required for tool calls from messaging channel turns (Telegram, WhatsApp)
+- **Sandbox env var forwarding**: sandbox containers don't inherit host env; use `sandbox.docker.env` with SecretRef `${VAR_NAME}`; vars named KEY/SECRET/TOKEN/PASSWORD are blocked
+- **`strictInlineEval`**: default `true` blocks `node -e`, `python -c` even when binary is allowlisted; use `exec curl` or `exec printenv` instead
+- **`autoAllowSkills`**: set `true` in exec-approvals if skills declare `requires.bins`; without it, socket approval times out at 120s in cron/sandbox
+- **Sandbox workspace snapshot**: only copies identity files + `skills/` dir; custom root workspace files unavailable in sandbox
+- **Cron delivery channel syntax**: `--channel telegram --to <chatId>` (not combined `telegram:dm:<chatId>`)
+- **`systemEvent` relay regression (v2026.4.1+)**: runtime event trust wraps payloads as untrusted; use system crontab for deterministic shell ops
+- **Upgrade ceremony**: after `openclaw update`, must `gateway install --force` + `daemon-reload` per profile
 - **LOCAL env (optional)**: symlink workspace to git repo for immediate visibility during development — no promote step needed
 
 ## Key Concepts

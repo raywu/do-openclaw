@@ -535,6 +535,13 @@ If any workspace file is missing or corrupt:
 - Do NOT proceed with normal operations until operator confirms.
 ---END BOOT.md---
 
+IMPORTANT: Do NOT include tool calls in BOOT.md that depend on external services
+(network, APIs, databases). If any boot-time tool call fails (service not ready,
+network timeout), the failure context pollutes the session and can cause the agent
+to stop calling tools for ALL subsequent requests in that session. Keep BOOT.md
+limited to local file reads and `openclaw` CLI commands. Move connectivity-dependent
+startup checks to HEARTBEAT.md's "On Startup" section instead.
+
 6. Create ~/.openclaw-dev/workspace/SYSTEM_LOG.md:
 
 ---BEGIN SYSTEM_LOG.md---
@@ -639,7 +646,8 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
         "anthropic/claude-sonnet-4-5": {},
         "anthropic/claude-sonnet-4-6": {
           "params": {
-            "cacheRetention": "long"
+            "cacheRetention": "long",
+            "thinking": "high"
           }
         }
       },
@@ -728,7 +736,12 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
   "cron": {
     "enabled": true,
     "maxConcurrentRuns": 2,
-    "sessionRetention": "24h"
+    "sessionRetention": "4h"
+  },
+  "session": {
+    "maintenance": {
+      "mode": "enforce"
+    }
   },
   "channels": {
     "whatsapp": {
@@ -873,6 +886,26 @@ IMPORTANT: The base debian:bookworm-slim image has NO curl. If your skills use
 `exec curl` from sandbox sessions, you must add curl to the sandbox Dockerfile.
 Without it, `exec curl` commands in skills will fail silently with no output.
 
+SANDBOX ENV VAR FORWARDING: Sandbox containers do NOT inherit host env vars.
+To forward env vars, add them to `agents.defaults.sandbox.docker.env` in
+openclaw.json using SecretRef syntax: `"DATABASE_URL": "${DATABASE_URL}"`.
+Without this, exec curl with auth headers and DB-dependent logic fail silently
+from cron/sandbox sessions.
+
+NOTE: Docker sandbox blocks env vars with KEY, SECRET, TOKEN, or PASSWORD in
+their names. Use the internal API endpoint pattern (localhost REST API) to pass
+secrets server-side instead of forwarding them to sandbox.
+
+SANDBOX EXEC LIMITATIONS:
+- `strictInlineEval` (default: true) blocks `node -e`, `python -c`, `bash -c`
+  even when the binary is in the exec allowlist. Use exec curl for API calls or
+  exec printenv for env var reads.
+- Shell expansion does NOT work: `exec echo $VAR` returns literal `$VAR`.
+  Use `exec printenv VAR_NAME` instead.
+- Sandbox workspace snapshot only includes core identity files (SOUL.md,
+  AGENTS.md, TOOLS.md, USER.md, IDENTITY.md, HEARTBEAT.md) and skills/ dir.
+  Custom root-level workspace files are NOT available in sandbox sessions.
+
 If scripts/sandbox-setup.sh doesn't exist, tell me — the OpenClaw version may handle this differently.
 
 ═══════════════════════════════════════════════════════════
@@ -920,6 +953,10 @@ Phase 3.11 — Create ~/.openclaw/exec-approvals.json with this EXACT content:
 ---END exec-approvals.json---
 
 Add additional entries to the allowlist as needed for your domain (e.g., backup scripts, custom tooling). Each entry should be the resolved absolute path to the binary.
+
+> **`autoAllowSkills`:** If set to `true`, binaries declared in a skill's frontmatter `requires.bins` are auto-approved without socket confirmation. If `false` (default, shown above), those bins trigger socket-based approval that times out at 120s and denies in cron/sandbox sessions (no approval listener). Set to `true` if your skills declare required binaries and run in cron/sandbox.
+>
+> **Include both full path AND bare name** for each binary in the allowlist. Exec-approvals matches the command string prefix — the agent may send `curl ...` (bare) or `/usr/bin/curl ...` (full path). Also verify paths inside the Docker sandbox: `docker run --rm openclaw-sandbox:bookworm-slim which <binary>` — host and container paths may differ.
 
 chmod 600 ~/.openclaw/exec-approvals.json
 
@@ -1468,6 +1505,19 @@ to the main session's last active channel (which may be a customer DM):
   openclaw cron edit <id> --delivery-mode none
 Without this, cron output leaks to whichever channel the operator last interacted with.
 
+DELIVERY CHANNEL SYNTAX: Use `--channel telegram --to <chatId>` (separate flags),
+NOT `--channel telegram:dm:<chatId>` (combined format fails to resolve on delivery).
+The `--to` field provides session context even with delivery disabled.
+
+TELEGRAM MESSAGE LIMITS: Telegram enforces a 4096 character limit per message.
+Skills producing long output must instruct the agent to split into multiple messages.
+The message tool target must be `telegram:<chatId>` (e.g., `telegram:5906288273`),
+not a symbolic name like "operator".
+
+NOTE (v2026.4.1+): `systemEvent` payloads are now wrapped in a relay frame that
+causes the model to relay instead of execute. Use system crontab for deterministic
+shell ops; reserve OpenClaw cron for agent-reasoning tasks (agentTurn).
+
 IMPORTANT — Sandbox tool allowlist:
 After any change to tools.sandbox.tools.allow in openclaw.json, rebuild sandbox containers:
   openclaw sandbox recreate --all
@@ -1542,6 +1592,14 @@ MEMORY & CRON ISOLATION TESTS:
     If either is missing, isolated cron jobs cannot delegate to main session.
 28. Verify memory-init cron exists:
     openclaw cron list | grep memory-init → must show the job
+
+SESSION & MODEL CONFIG TESTS:
+29. grep '"maintenance"' ~/.openclaw/openclaw.json → must show "mode": "enforce"
+30. grep '"sessionRetention"' ~/.openclaw/openclaw.json → must show "4h"
+31. grep '"thinking"' ~/.openclaw/openclaw.json → must show "high" (required for tool calls from messaging channels)
+32. Verify delivery mode on all cron jobs:
+    openclaw cron list --json | python3 -c "import json,sys; jobs=json.load(sys.stdin)['jobs']; [print(f'WARN: {j[\"name\"]} has delivery mode {j.get(\"delivery\",{}).get(\"mode\",\"MISSING\")}') for j in jobs if j.get('delivery',{}).get('mode') != 'none']"
+    → should print nothing (all jobs should have delivery.mode: "none")
 
 [IF TASK 3 WAS COMPLETED — run these tests; skip if Task 3 was skipped]
 GOOGLE SHEETS TESTS (will trigger OAuth flow on first run):

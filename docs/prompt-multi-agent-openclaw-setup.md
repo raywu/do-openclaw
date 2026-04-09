@@ -846,7 +846,12 @@ Phase 3b (3.8) — This is the COMPLETE openclaw.json. It REPLACES any earlier p
   "cron": {
     "enabled": true,
     "maxConcurrentRuns": 2,
-    "sessionRetention": "24h"
+    "sessionRetention": "4h"
+  },
+  "session": {
+    "maintenance": {
+      "mode": "enforce"
+    }
   },
   "channels": {
     "whatsapp": {
