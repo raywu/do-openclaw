@@ -1,6 +1,6 @@
 # OpenClaw Design Patterns & Architecture Reference
 
-<!-- last-verified: 2026-03-26 | openclaw: 2026.3.8 -->
+<!-- last-verified: 2026-04-10 | openclaw: 2026.4.1 -->
 
 > **Purpose:** Persistent reference for understanding OpenClaw's architecture,
 > design patterns, and operational conventions. Derived from production
@@ -605,6 +605,10 @@ Production-discovered mistakes that cause silent failures or data leaks:
 | Tool calls in BOOT.md depending on external services | Boot-time tool failures poison the session — model stops calling tools for all subsequent requests | Agent enters "degraded mode" for entire session lifetime |
 | Step-by-step dispatch templates in AGENTS.md | LLM pattern-matches the template structure and generates expected output text instead of executing tools | Agent produces formatted text describing what it would do instead of calling tools |
 | DEV config diverging from PROD structure | Partial DEV config tests a different system — bugs pass DEV, fail PROD | `diff <(openclaw --profile prod config get .) <(openclaw --profile dev config get .)` to catch drift |
+| `sessions_send` without verifying main session exists | Target session key doesn't exist in `sessions.json` | Silent failure — cron completes but delegation never happens |
+| Mini-class models for cron jobs that read sandbox files | `gpt-4.1-mini` cannot use the file read tool in sandbox | Cron silently skips file-dependent steps; haiku-class works |
+| Overwriting (not appending) memory files from isolated cron | Isolated cron uses `write` instead of `edit` (append) | Previous entries silently lost; only latest cron run survives |
+| `rsync --delete` without excluding runtime data | `--delete` removes `memory/`, `SYSTEM_LOG.md` written at runtime | Destroys agent state, memory, and audit trail on next sync |
 
 ---
 
@@ -800,6 +804,24 @@ Sandbox sessions only receive a snapshot of core identity files (`SOUL.md`, `AGE
 
 **Fix:** Use the OpenClaw memory system (`memory_search`/`memory_get`) for cross-run state persistence from sandbox. Place data that sandbox sessions need inside `skills/` subdirectories or the `memory/` directory (indexed by the memory system).
 
+#### Sandbox Docker Image Must Be Explicitly Built
+
+`sandbox-setup.sh` is not run automatically during OpenClaw installation. Without the sandbox Docker image, ALL isolated and cron sessions fail silently — they cannot start a container, so the session produces no output and no error.
+
+**Fix:** Verify the image exists after installation and after any Docker cleanup: `docker images | grep openclaw-sandbox`. If missing, rebuild: `sg docker -c "cd ~/.openclaw && bash scripts/sandbox-setup.sh"`. Add this check to deployment and upgrade scripts.
+
+#### fnm Binary Path Resolution in `exec-approvals`
+
+When Node.js is managed by `fnm` (Fast Node Manager), binaries live at `~/.local/share/fnm/node-versions/<version>/bin/node` instead of `/usr/bin/node`. The exec-approvals allowlist silently denies if the path doesn't match inside the container or on the host.
+
+**Fix:** Include both standard paths (`/usr/bin/node`) and fnm-managed paths in exec-approvals. Better yet, prefer API endpoints via `exec curl` over `exec node` — this avoids path resolution issues entirely.
+
+#### fnm Not in Default SSH PATH
+
+SSH commands that need `npm` or `node` (e.g., deploy scripts, cron sync scripts) fail because `fnm` is not loaded in non-login shell sessions. The `.bashrc` that initializes fnm is not sourced for non-interactive SSH commands.
+
+**Fix:** Wrap SSH commands with `bash -lc "<command>"` or prefix with `eval "$(~/.local/share/fnm/fnm env)"` to load fnm into the shell environment.
+
 #### `autoAllowSkills` for Skill Bin Execution
 
 Without `autoAllowSkills: true` in `exec-approvals.json`, binaries listed in a skill's frontmatter `requires.bins` trigger socket-based approval. Since there's no approval listener in cron/sandbox sessions, the request times out at 120s and denies.
@@ -840,7 +862,25 @@ Without extended thinking enabled (`params.thinking: "high"` or equivalent in mo
 
 After many failed tool attempts accumulate in a session (28+ in one observed case), the model learns a "generate text, don't call tools" pattern and stops calling tools entirely — even with explicit instructions.
 
-**Fix:** Delete the polluted session and restart the gateway to create a fresh session. Prevention: fix tool failures early (don't let them accumulate), and configure session maintenance to auto-clear stale sessions.
+**Fix:** Delete the polluted session and restart the gateway to create a fresh session. In one observed case, the threshold was ~28 failed attempts before the model stopped calling tools entirely. Prevention: fix tool failures early (don't let them accumulate), monitor tool failure counts, and configure session maintenance to auto-clear stale sessions.
+
+#### Mini Models Cannot Read Sandbox Files
+
+`gpt-4.1-mini` and similar mini-class models cannot use the file read tool in sandbox sessions. The tool call is available but the model fails to invoke it correctly. Haiku-class models (e.g., `claude-3.5-haiku`) can read sandbox files reliably.
+
+**Fix:** Upgrade cron jobs that need to read config or data files in sandbox from mini-class to haiku-class. Reserve mini for template-based sends and simple formatting tasks that don't require file reads.
+
+#### `thinking:high` Timeout Overhead
+
+Extended thinking (`params.thinking: "high"`) adds 2-3x latency to cron job execution (e.g., a 480s job becomes 900s). Do not override with `--thinking off` on individual cron jobs — this fundamentally changes model behavior and may break tool-calling chains.
+
+**Fix:** Increase cron job timeouts to accommodate thinking overhead rather than disabling thinking. Use `openclaw cron edit <id> --timeout 900` for jobs that run long with thinking enabled.
+
+#### `sessions_send` Requires Main Session to Exist
+
+Clearing `sessions.json` (e.g., during cleanup or redeployment) before running cron jobs that use `sessions_send` fails silently. The target session key (`agent:main:main`) must exist in the session store before any isolated cron can delegate to it.
+
+**Fix:** After clearing sessions or deploying, restart the gateway and send a message to the main session (via Telegram or CLI) to ensure it is initialized before cron jobs fire. Add a session existence check to deployment scripts.
 
 ### Delivery & Messaging
 
@@ -907,6 +947,32 @@ Without session maintenance, sandbox containers from cron and subagent runs accu
 
 **Fix:** Remove `dmScope` for single-operator bots so DMs route to the unsandboxed main session. Re-enable `per-channel-peer` only when multi-user support is needed.
 
+#### Cron Timezone Drift
+
+The `tz` field on cron jobs can be silently lost when editing jobs via `openclaw cron edit` or when sync scripts modify schedule expressions. A cron registered with `tz: "America/Los_Angeles"` may revert to UTC interpretation after an edit.
+
+**Fix:** After any cron edit, verify timezone preservation: `openclaw cron list --json | jq '.jobs[] | {name, schedule, tz}'`. Include this check in cron sync scripts and weekly maintenance audits. Always re-specify `--tz` when editing cron schedules.
+
+#### Config-Cache Transient Failures
+
+Config-cache refresh operations can fail with `node ENOENT` errors referencing a temporary file. The failure is transient — retry always succeeds. Observed pattern: 4-5 transient failures in a 6-hour window, each succeeding on second attempt.
+
+**Fix:** Build retry logic (2-3 attempts with 1s backoff) into any script that refreshes the config cache. Do not treat the first failure as fatal.
+
+### Memory
+
+#### Memory Init: Append Not Overwrite
+
+Isolated cron sessions writing to `memory/SYSTEM_LOG.md` or daily memory files can overwrite instead of appending. The model defaults to using the `write` tool (full file replacement) rather than `edit` (targeted append) when not explicitly instructed.
+
+**Fix:** Include explicit "APPEND to the file — do not overwrite existing content" instructions in cron payloads that write to memory files. Use `edit` tool with append semantics, not `write`. Verify by checking file size after cron runs — a shrinking file indicates overwrite.
+
+#### Memory Files Indexed, Workspace Root Files Not
+
+Only files in the `memory/` directory are indexed for `memory_search`. Root-level workspace files (e.g., custom config dumps, data files, signal files) do not appear in search results even though they are readable from the workspace.
+
+**Fix:** For persistent searchable state, write to the `memory/` subdirectory. For data that must remain at workspace root, reference it by explicit file path in skills rather than relying on `memory_search` to surface it.
+
 ### Deployment & Upgrades
 
 #### Port Fixup for Multi-Environment Skills
@@ -972,6 +1038,12 @@ OpenClaw v2026.4.1 introduced "Runtime Event Trust" security hardening (#62003) 
 
 **Fix:** Use system crontab (`crontab -e`) for deterministic shell operations. Reserve OpenClaw cron for agent-reasoning tasks (`agentTurn` with isolated sessions). For agent-aware tasks from system crontab, use `openclaw agent --deliver`.
 
+#### Rsync `--delete` Must Exclude Runtime Data
+
+When using `rsync --delete` to sync workspace files from source to target (e.g., promotion scripts), the `--delete` flag removes files that exist on the target but not the source. Agent-written runtime data — `memory/`, `.openclaw/`, `SYSTEM_LOG.md` — will be destroyed.
+
+**Fix:** Add explicit excludes to all sync commands: `rsync --delete --exclude='memory/' --exclude='.openclaw/' --exclude='SYSTEM_LOG.md' --exclude='cron/'`. Verify exclude list in all promotion and sync scripts. The `PROD-Owned Files` list (Section 9) defines which files must be excluded.
+
 ---
 
 ## 14. A2A Architecture Principle
@@ -1029,3 +1101,49 @@ This architecture aligns with:
 - **Google A2A Protocol** — protocol-agnostic, Agent Card discovery, structured data exchange
 
 All three initiatives converge on deterministic APIs for routine operations, with LLMs reserved for tasks requiring reasoning.
+
+---
+
+## 15. Advanced Design Patterns
+
+### Cross-Session Write Pattern
+
+When sandbox sessions need to persist data to workspace or memory files, they cannot write directly (`sandbox.workspaceAccess: "ro"`). Use a delegation chain:
+
+1. Cron/sandbox session processes data and produces structured output
+2. Calls `sessions_send` to `agent:main:main` with explicit write instructions
+3. Main session receives the payload and writes to `memory/` or workspace files
+
+This is a specific application of the Delegation Pattern (Section 3) for write operations. All prerequisites apply: `tools.subagents.tools.alsoAllow: ["sessions_send"]` and `agents.defaults.sandbox.sessionToolsVisibility: "all"` must be configured. Split each write intent into a separate `sessions_send` call to avoid partial processing (see Section 13, `sessions_send` Partial Processing).
+
+### Quorum Gates for Shared Files
+
+When multiple cron jobs or data sources contribute to a shared output file (e.g., a daily report, aggregated signals), use a quorum gate to prevent bad-day runs from poisoning downstream consumers.
+
+**Pattern:** If fewer than N out of M sources pass a quality gate (data freshness, minimum row count, format validation), keep the previous file intact. Only overwrite when the quorum passes.
+
+**Implementation:** The skill checks source quality before writing. If the quorum fails, it logs the failure to `memory/` and exits without modifying the shared file. Include a `run_id` (e.g., `skill-name-2026-04-10T09:00:00Z`) for idempotency — a single `sessions_send` call with `run_id` ensures all-or-nothing writes.
+
+### Skillsync Verification (4 Axes)
+
+After editing any skill that has a cron trigger, verify four axes before considering the change complete:
+
+1. **Registry:** `openclaw skills list` shows the updated skill without errors
+2. **Cron snapshot:** If the cron payload references skill content, update it: `openclaw cron edit <id> --message "<updated text>"`
+3. **Cron-to-skill mapping:** The cron job's trigger prompt and the skill's frontmatter `name`/`description` agree on invocation conditions
+4. **Sandbox tools:** `openclaw sandbox explain` lists all tools the updated skill needs in the allow list
+
+Missing any axis leads to silent failures — the cron fires but the skill runs with stale instructions, missing tools, or a mismatched trigger. Automate this check as a post-edit verification script.
+
+### Signals vs. Observations Data Pattern
+
+For agents that collect and consume recurring data across cron cycles, separate storage into two tiers:
+
+| Tier | Update Strategy | Retention | Consumer Pattern |
+|------|----------------|-----------|-----------------|
+| **Signals** | Deduplicated, compact, overwritten daily | Latest only (max ~30 entries) | Skills read signals — cheap, small context |
+| **Observations** | Raw log, append-only, capped by size/age | Rolling window (e.g., 500 lines / 14 days) | Audit trail, debugging, reprocessing |
+
+**Rule:** Consumer skills read signals, not observations. Reading 14 days of raw observation logs is expensive and wastes context; reading 30 signal lines is cheap.
+
+**Implementation:** Signals go in `memory/signals/` (e.g., `memory/signals/market-summary.md`). Observations go in `memory/observations/` (e.g., `memory/observations/2026-04-10.md`). A daily cron processes observations into signals. Apply quorum gates (above) when overwriting signal files.

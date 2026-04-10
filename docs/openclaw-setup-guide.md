@@ -1769,6 +1769,23 @@ openclaw sandbox explain
 - Workspace file changes (SOUL.md, AGENTS.md, skills) are not picked up by existing sessions. The gateway reuses sessions from the session store.
 - After major instruction changes: restart the gateway AND delete the relevant session entry from `sessions.json`, then restart again.
 
+**fnm path issues (node/npm not found in scripts or cron):**
+- SSH commands and cron scripts run in non-login shells where fnm is not loaded.
+- Fix: wrap commands with `bash -lc "<command>"` or prefix with `eval "$(~/.local/share/fnm/fnm env)"`.
+- Verify: `ssh clawuser@YOUR_DROPLET_IP "bash -lc 'node --version'"` — must return a version.
+- For exec-approvals: include fnm-managed paths (`~/.local/share/fnm/node-versions/*/bin/node`) alongside standard paths (`/usr/bin/node`).
+
+**`sessions_send` from cron fails silently:**
+- Verify main session exists: `openclaw session list` — must show `agent:main:main`. If missing, send a message to the agent via Telegram or CLI to initialize it.
+- Verify config prerequisites: `grep '"sessionToolsVisibility"' ~/.openclaw/openclaw.json` (must show `"all"`) and `grep '"alsoAllow"' ~/.openclaw/openclaw.json` (must show `"sessions_send"`).
+- After any session cleanup or `sessions.json` reset, restart the gateway and trigger a main session interaction before cron fires.
+
+**DM session accumulation:**
+- Symptoms: main session output routing becomes unpredictable; internal messages leak to customer DMs.
+- Check: `openclaw session list | grep direct` — count should be low (single digits). High counts indicate the hourly checkpoint prune is not running or not effective.
+- Fix: verify the hourly checkpoint cron job is registered and running: `openclaw cron list | grep checkpoint`. Ensure it prunes stale `[channel]:direct` sessions.
+- Emergency: manually delete stale DM sessions from `sessions.json` and restart the gateway.
+
 ---
 
 ### Phase 7: Ongoing Maintenance
@@ -1786,6 +1803,8 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - Review session logs for denied tool attempts: `grep -r "email_send\|exec\|gateway_config" ~/.openclaw/agents/*/sessions/` — any hits indicate injection attempts.
 - Review session count and container buildup: `openclaw session list` — verify session maintenance is cleaning up stale containers. If counts grow, check `session.maintenance.mode` is `"enforce"` and `cron.sessionRetention` is `"4h"`.
 - DEV/PROD parity check: `diff <(openclaw --profile prod config get .) <(openclaw --profile dev config get .)` — structural differences (beyond workspace path and channels) are bugs.
+- Verify cron timezone fields are intact: `openclaw cron list --json | jq '.jobs[] | {name, schedule, tz}'` — all jobs should show their expected timezone. Re-apply with `openclaw cron edit <id> --tz <timezone>` if any show `null`.
+- Check DM session count: `openclaw session list | grep -c direct` — should be low (single digits). If accumulating, verify the hourly checkpoint prune is running. High counts cause routing table contamination and message leaks.
 
 **Monthly:**
 - Run a security audit: `openclaw security audit --deep`
@@ -1812,7 +1831,8 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - **Cron jobs are self-contained.** Each cron job runs in its own session context — it cannot see other sessions' conversation history. It must read all state from files or external sources.
 - **`sessions_send` from isolated cron (v2026.3.8+):** If isolated cron jobs need to delegate to the main session, two `openclaw.json` entries are required: `tools.subagents.tools.alsoAllow: ["sessions_send"]` (overrides the deny list) and `agents.defaults.sandbox.sessionToolsVisibility: "all"` (lets sandboxed sessions see `agent-main-main`). Without both, isolated cron jobs silently fail to delegate.
 - **Version-control cron snapshots.** Periodically snapshot cron jobs to `cron/jobs.json` in the workspace and track in git. This provides an audit trail and makes drift detection easy.
-- **Model routing for cost optimization.** Use cheaper models for mechanical cron jobs (template sends, data reads) and frontier models for complex reasoning. Per-cron override: `openclaw cron edit <id> --model <model>`.
+- **Model routing for cost optimization.** Use cheaper models for mechanical cron jobs (template sends, data reads) and frontier models for complex reasoning. Per-cron override: `openclaw cron edit <id> --model <model>`. Note: mini-class models (e.g., `gpt-4.1-mini`) cannot use the file read tool in sandbox — use haiku-class or above for cron jobs that need to read files.
+- **Promotion scripts must exclude runtime data.** When using `rsync --delete` in promote scripts, exclude `memory/`, `.openclaw/`, `SYSTEM_LOG.md`, and `cron/`. These are written by the agent at runtime and do not exist in the source workspace. Without excludes, `--delete` destroys agent state on every promotion.
 
 **Memory System Operations:**
 

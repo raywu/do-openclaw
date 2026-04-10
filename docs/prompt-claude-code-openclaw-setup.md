@@ -1601,6 +1601,23 @@ SESSION & MODEL CONFIG TESTS:
     openclaw cron list --json | python3 -c "import json,sys; jobs=json.load(sys.stdin)['jobs']; [print(f'WARN: {j[\"name\"]} has delivery mode {j.get(\"delivery\",{}).get(\"mode\",\"MISSING\")}') for j in jobs if j.get('delivery',{}).get('mode') != 'none']"
     → should print nothing (all jobs should have delivery.mode: "none")
 
+SESSIONS & CRON INTEGRITY TESTS:
+33. Verify cron timezone fields are preserved:
+    openclaw cron list --json | jq '.jobs[] | {name, tz}'
+    → every job must show a non-null tz value matching its expected timezone
+    If any show null: openclaw cron edit <id> --tz <expected_timezone>
+34. Check DM session count:
+    openclaw session list | grep -c direct
+    → should be 0 at initial setup (no DM sessions created yet)
+    After production use, monitor this count weekly — rising counts indicate prune failures
+35. Verify sandbox Docker image exists:
+    docker images | grep openclaw-sandbox → must show the image
+    (Also checked in test 7 — critical enough to verify from both angles)
+36. Verify main session can be initialized:
+    openclaw session list | grep "agent:main:main"
+    → must show the main session. If missing, send a test message via Telegram or CLI to create it.
+    Isolated cron jobs using sessions_send will fail silently without a main session.
+
 [IF TASK 3 WAS COMPLETED — run these tests; skip if Task 3 was skipped]
 GOOGLE SHEETS TESTS (will trigger OAuth flow on first run):
 🛑 HUMAN GATE: "The first gog sheets command will open an OAuth browser flow. Complete it to grant Sheets-only access."
