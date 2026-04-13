@@ -1,6 +1,6 @@
 # OpenClaw Design Patterns & Architecture Reference
 
-<!-- last-verified: 2026-04-10 | openclaw: 2026.4.1 -->
+<!-- last-verified: 2026-04-13 | openclaw: 2026.4.1 -->
 
 > **Purpose:** Persistent reference for understanding OpenClaw's architecture,
 > design patterns, and operational conventions. Derived from production
@@ -297,6 +297,27 @@ For on-demand skills that don't need main session capabilities, main can spawn a
 7. **`delivery.mode: "none"` on all cron jobs.** Without this, cron output auto-delivers to the main session's last active channel. If the operator's last message was in a customer DM, cron output leaks to that customer. Set `delivery.mode: "none"` on every cron job and use explicit `message` tool calls (from main session) for intentional delivery.
 
 8. **Shell-script-only jobs use `systemEvent`, not `agentTurn`.** If a cron job only runs a shell script with no LLM reasoning needed (backups, health checks, file initialization), use `sessionTarget: "main"` with `triggerType: "systemEvent"`. This runs the script directly on the host without spinning up an agent session — saving tokens and latency. Reserve `agentTurn` for jobs that require LLM reasoning.
+
+### One-Shot Auto-Trigger Pattern
+
+When a server-side event should immediately trigger an agent skill instead of waiting for the next cron poll, create a fire-and-forget one-shot cron job:
+
+```
+Server event → openclaw cron add --name {skill}-auto-{uuid}
+  --at 1m --session isolated --no-deliver
+  --delete-after-run --message "Run {skill}..."  --timeout 60000
+→ Agent runs skill in sandbox ~1 min later → Job self-deletes after run
+```
+
+**Key requirements:**
+- **UUID in job name** prevents name collisions from rapid-fire triggers
+- **`--delete-after-run`** prevents job accumulation
+- **Keep the fallback cron** as a safety net — the auto-trigger claims rows first via atomic `UPDATE...RETURNING`, leaving nothing for the fallback cron
+- **Atomic claims** prevent duplicate actions when auto-trigger and fallback cron overlap. Use `UPDATE...RETURNING` (not SELECT-then-UPDATE) for any claim-before-act pattern
+
+**When to use:** Server-side events (config changes, status updates, admin actions) that need near-real-time agent response. The server creates the one-shot job via the OpenClaw CLI or API.
+
+**When NOT to use:** High-frequency events (>1/minute) — use a webhook-to-main-session pattern instead.
 
 ### Memory-Tag-Then-Batch Pattern
 
@@ -609,6 +630,10 @@ Production-discovered mistakes that cause silent failures or data leaks:
 | Mini-class models for cron jobs that read sandbox files | `gpt-4.1-mini` cannot use the file read tool in sandbox | Cron silently skips file-dependent steps; haiku-class works |
 | Overwriting (not appending) memory files from isolated cron | Isolated cron uses `write` instead of `edit` (append) | Previous entries silently lost; only latest cron run survives |
 | `rsync --delete` without excluding runtime data | `--delete` removes `memory/`, `SYSTEM_LOG.md` written at runtime | Destroys agent state, memory, and audit trail on next sync |
+| Env vars in SKILL.md `exec` commands (`$VAR`) | `exec` uses `execFile` — no shell expansion; `$VAR` passed as literal string | API calls get literal `$VAR` as hostname/token; silent 4xx or connection refused |
+| Wrapper scripts in exec-approvals with glob patterns | Glob patterns (`**/scripts/*`) break the allowlist parser | ALL exec commands fail, not just the wrapper — total exec lockout |
+| LLM-substituted variables in `exec` commands | LLMs unreliably substitute TOOLS.md variables; sometimes pass literal `$VAR` to exec | Intermittent PROD failures — works in testing, fails under load or with different models |
+| SELECT-then-UPDATE for claim-before-act | Race condition when auto-trigger and fallback cron overlap | Duplicate DMs/actions sent to customers; use atomic `UPDATE...RETURNING` instead |
 
 ---
 
@@ -1044,6 +1069,38 @@ When using `rsync --delete` to sync workspace files from source to target (e.g.,
 
 **Fix:** Add explicit excludes to all sync commands: `rsync --delete --exclude='memory/' --exclude='.openclaw/' --exclude='SYSTEM_LOG.md' --exclude='cron/'`. Verify exclude list in all promotion and sync scripts. The `PROD-Owned Files` list (Section 9) defines which files must be excluded.
 
+#### Hardcoded URLs in Skills: Three Failed Approaches
+
+When DEV and PROD servers run on the same Droplet at different ports (e.g., `:3000` vs `:3001`), skills must target the correct port per environment. Three approaches to parameterize URLs all failed:
+
+| Approach | Why It Failed |
+|----------|---------------|
+| Env var in SKILL.md (`$API_URL`) | `exec` uses `execFile` — no shell expansion. `$VAR` passed as literal string. |
+| Wrapper script (`scripts/call-api.sh`) | `exec-approvals` glob patterns (`**/scripts/*`) broke the allowlist parser — ALL exec commands failed. |
+| TOOLS.md prompt variable (`$SERVER_URL`) | LLM substitution unreliable. Both GPT-5.1 and GPT-5.3-codex sometimes pass the literal variable to exec instead of substituting. Caused a PROD incident within hours — immediately reverted. |
+
+**Current reliable solution:** Hardcode `localhost:[PORT]` in SKILL.md files with the PROD port as the source-of-truth. Promotion scripts (`promote-dev.sh`) run sed to swap ports at deploy time. Defense-in-depth: internal API responses can include an `"environment"` field to catch mismatches during debugging.
+
+**Verification rule:** Before deploying to any environment, verify no wrong-environment ports exist:
+- DEV: `grep -r "localhost:[PROD_PORT]" ~/.openclaw-dev/workspace/skills/` — must return nothing
+- PROD: `grep -r "localhost:[DEV_PORT]" ~/.openclaw/workspace/skills/` — must return nothing
+
+#### Deploy Rsync Silent SKILL.md Skip
+
+`rsync` in deploy scripts can report a successful transfer while SKILL.md files on the target retain stale content and old mtimes. Root cause is unclear (possibly rsync size/time comparison logic or mtime preservation), but this has caused multiple incidents where deployed skills ran with outdated instructions.
+
+**Fix:** After every deploy that edits SKILL.md files, verify the change landed:
+```bash
+ssh $HOST 'grep -c "<known-new-marker>" ~/.openclaw-$PROFILE/workspace/skills/<skill>/SKILL.md'
+```
+If count is 0, directly scp the stale files and restart the gateway. Add this post-deploy verification to all deployment scripts.
+
+#### `sessions_send` ACK Verification in Session Logs
+
+Grepping session JSONL files for ACK outcomes (e.g., `OK_APPENDED`, `ERR_PARSE`) produces false positives because preloaded SKILL.md template text contains the same string literals. Template text appears in assistant `toolCall` message content, while real ACKs appear in separate `toolResult` blocks.
+
+**Fix:** Pair `sessions_send` `toolCall` blocks with their corresponding `toolResult` by `toolCallId` to distinguish real runtime ACKs from template text. Fire-and-forget sends use `status: "accepted"` (no ACK body). Timeout sends appear in `toolCall` with `timeoutSeconds` but have no matching `toolResult`.
+
 ---
 
 ## 14. A2A Architecture Principle
@@ -1147,3 +1204,25 @@ For agents that collect and consume recurring data across cron cycles, separate 
 **Rule:** Consumer skills read signals, not observations. Reading 14 days of raw observation logs is expensive and wastes context; reading 30 signal lines is cheap.
 
 **Implementation:** Signals go in `memory/signals/` (e.g., `memory/signals/market-summary.md`). Observations go in `memory/observations/` (e.g., `memory/observations/2026-04-10.md`). A daily cron processes observations into signals. Apply quorum gates (above) when overwriting signal files.
+
+### Heartbeat Incident Packet Pattern
+
+For agents running repeated skills, HEARTBEAT.md should detect failure patterns and assemble structured incident packets for the operator:
+
+1. Skills log self-check results to `SYSTEM_LOG.md`: `[SELF-CHECK] YYYY-MM-DD HH:MM | <skill> | PASS|FAIL | <detail> | <run_id>`
+2. Heartbeat scans SYSTEM_LOG.md for patterns: N or more failures of the same check within M days (e.g., 3+ failures in 7 days)
+3. On pattern match, assemble an incident packet:
+   ```
+   [INCIDENT] <timestamp> | <skill> | <check_id> | <check_name>
+   failures: <N> in last 7 days (of <runs_evaluated> total)
+   last_good: <most recent PASS run_id>
+   last_fail: <most recent FAIL run_id>
+   context: <detail from most recent failure>
+   ```
+4. Send to operator via trusted channel (Telegram DM)
+
+**Dedup:** Max 1 alert per check_id per UTC day to prevent alert fatigue.
+
+**Grace period:** Suppress alerts for 3 hours after gateway restart to avoid false alarms during startup and session warm-up.
+
+**Threshold tuning:** Start with 3 failures in 7 days. Tighten for critical skills (2 in 3 days), loosen for flaky external dependencies (5 in 7 days).

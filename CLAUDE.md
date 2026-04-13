@@ -56,6 +56,11 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **`systemEvent` relay regression (v2026.4.1+)**: runtime event trust wraps payloads as untrusted; use system crontab for deterministic shell ops
 - **Upgrade ceremony**: after `openclaw update`, must `gateway install --force` + `daemon-reload` per profile
 - **LOCAL env (optional)**: symlink workspace to git repo for immediate visibility during development — no promote step needed
+- **No shell expansion in exec**: `exec` uses `execFile`, not shell — `$VAR` passed as literal; use `exec printenv` or API endpoints via `exec curl`
+- **Hardcoded URLs + sed fixup**: env vars, wrapper scripts, and LLM variable substitution all fail for URL parameterization in skills; hardcode + sed in promote scripts
+- **One-shot auto-trigger**: `openclaw cron add --at 1m --delete-after-run` for event-driven skill execution; use atomic `UPDATE...RETURNING` for claim-before-act
+- **Deploy rsync silent skip**: rsync can report success while SKILL.md files stay stale; always post-deploy grep for a known marker
+- **`sessions_send` ACK verification**: grepping session JSONL for ACK strings gives false positives from template text; pair by `toolCallId` to distinguish real ACKs
 
 ## Key Concepts
 

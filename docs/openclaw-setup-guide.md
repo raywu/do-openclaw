@@ -1786,6 +1786,17 @@ openclaw sandbox explain
 - Fix: verify the hourly checkpoint cron job is registered and running: `openclaw cron list | grep checkpoint`. Ensure it prunes stale `[channel]:direct` sessions.
 - Emergency: manually delete stale DM sessions from `sessions.json` and restart the gateway.
 
+**Deploy reports success but skills are stale:**
+- `rsync` can report a successful transfer while SKILL.md files retain old content on the target. Root cause unclear (mtime/size comparison edge case).
+- After every deploy that edits skills, verify the change landed: `ssh $HOST 'grep -c "<known-new-marker>" ~/.openclaw-$PROFILE/workspace/skills/<skill>/SKILL.md'`
+- If count is 0, directly scp the stale files: `scp deploy/workspace/skills/<skill>/SKILL.md $HOST:~/.openclaw-$PROFILE/workspace/skills/<skill>/SKILL.md`
+- Restart the gateway after manual scp to pick up changes.
+
+**Skills calling wrong environment's API (port mismatch):**
+- If DEV and PROD run on different ports on the same host, skills may target the wrong port after promotion.
+- Verify no wrong-port references exist: `grep -r "localhost:[WRONG_PORT]" ~/.openclaw-$PROFILE/workspace/skills/`
+- All three approaches to parameterize URLs fail in OpenClaw exec: env vars (no shell expansion), wrapper scripts (breaks allowlist), LLM-substituted variables (unreliable). Use hardcoded ports + sed fixup in promotion scripts.
+
 ---
 
 ### Phase 7: Ongoing Maintenance
@@ -1805,6 +1816,7 @@ Setup is not a one-time event. Schedule these recurring maintenance tasks:
 - DEV/PROD parity check: `diff <(openclaw --profile prod config get .) <(openclaw --profile dev config get .)` — structural differences (beyond workspace path and channels) are bugs.
 - Verify cron timezone fields are intact: `openclaw cron list --json | jq '.jobs[] | {name, schedule, tz}'` — all jobs should show their expected timezone. Re-apply with `openclaw cron edit <id> --tz <timezone>` if any show `null`.
 - Check DM session count: `openclaw session list | grep -c direct` — should be low (single digits). If accumulating, verify the hourly checkpoint prune is running. High counts cause routing table contamination and message leaks.
+- If running multi-environment (DEV/PROD) on the same host: verify no wrong-port references in skills: `grep -r "localhost:[WRONG_PORT]" ~/.openclaw/workspace/skills/` and `grep -r "localhost:[WRONG_PORT]" ~/.openclaw-dev/workspace/skills/`
 
 **Monthly:**
 - Run a security audit: `openclaw security audit --deep`

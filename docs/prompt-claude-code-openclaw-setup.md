@@ -1618,6 +1618,14 @@ SESSIONS & CRON INTEGRITY TESTS:
     → must show the main session. If missing, send a test message via Telegram or CLI to create it.
     Isolated cron jobs using sessions_send will fail silently without a main session.
 
+DEPLOY & SKILL INTEGRITY TESTS:
+37. Verify no stale skill files after setup:
+    ls -la ~/.openclaw/workspace/skills/*/SKILL.md
+    → all SKILL.md files should have recent timestamps matching the setup session
+38. If running multi-environment (DEV/PROD on same host), verify no port cross-contamination:
+    grep -r "localhost:[DEV_PORT]" ~/.openclaw/workspace/skills/ → must return nothing (PROD should only have PROD port)
+    grep -r "localhost:[PROD_PORT]" ~/.openclaw-dev/workspace/skills/ → must return nothing (DEV should only have DEV port)
+
 [IF TASK 3 WAS COMPLETED — run these tests; skip if Task 3 was skipped]
 GOOGLE SHEETS TESTS (will trigger OAuth flow on first run):
 🛑 HUMAN GATE: "The first gog sheets command will open an OAuth browser flow. Complete it to grant Sheets-only access."
