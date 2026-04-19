@@ -1,6 +1,6 @@
 # OpenClaw Design Patterns & Architecture Reference
 
-<!-- last-verified: 2026-04-13 | openclaw: 2026.4.1 -->
+<!-- last-verified: 2026-04-19 | openclaw: 2026.4.14 -->
 
 > **Purpose:** Persistent reference for understanding OpenClaw's architecture,
 > design patterns, and operational conventions. Derived from production
@@ -855,6 +855,29 @@ Without `autoAllowSkills: true` in `exec-approvals.json`, binaries listed in a s
 
 **Tradeoff:** `false` is more restrictive (manual allowlist only); `true` trusts skill frontmatter declarations.
 
+#### Exec-Approvals: Bare Names AND Absolute Paths
+
+`exec` passes args to `execFile` without shell `PATH` resolution. The agent emits `curl ...` (bare name), but `exec-approvals.json` may list `/usr/bin/curl` (absolute path) — causing a silent allowlist miss despite the binary being "allowed". Agents then hallucinate success (see "LLM Hallucinated API Responses").
+
+**Fix:** Allowlist BOTH forms for every binary the agent uses:
+```json
+{
+  "bins": {
+    "curl":          { "allow": true },
+    "/usr/bin/curl": { "allow": true },
+    "ls":            { "allow": true },
+    "cat":           { "allow": true },
+    "env":           { "allow": true },
+    "grep":          { "allow": true },
+    "printenv":      { "allow": true }
+  }
+}
+```
+
+Bare-name entries for `ls`/`cat`/`env`/`grep` enable agent self-diagnosis (listing sandbox config, reading env) without escalation. Docker sandbox isolation contains the residual risk.
+
+**Verification:** Trigger from a sandbox session (cron run), not from `agent -m` — `-m` runs on host with full access and masks the allowlist gap.
+
 ### Session & Model Behavior
 
 #### LLM Hallucinated API Responses
@@ -907,6 +930,46 @@ Clearing `sessions.json` (e.g., during cleanup or redeployment) before running c
 
 **Fix:** After clearing sessions or deploying, restart the gateway and send a message to the main session (via Telegram or CLI) to ensure it is initialized before cron jobs fire. Add a session existence check to deployment scripts.
 
+#### Agent Hallucinated "Done ✅" with No Tool Calls
+
+Long-lived operator DM sessions can drift into a text-only rut where the agent replies "Done ✅" without actually invoking any tool. The downstream effect (DB write, DM send, log append) never happened — but the operator sees a convincing confirmation. Related to conversation-history pollution: the model has learned a "generate text, don't call tools" pattern from prior failed attempts in the same session.
+
+**Detection:** For any operator message that requires a side effect, grep the active session JSONL (path from `sessions.json`) for a `toolCall` block between the operator message and the agent's reply. Absence of a tool call is the signature.
+
+```bash
+JSONL=$(jq -r '."agent:main:main".transcript' ~/.openclaw/sessions.json)
+tail -200 "$JSONL" | jq -r 'select(.role=="assistant") | .content[]? | .type' \
+  | grep -q tool_use || echo "HALLUCINATION: no tool_use in recent assistant turns"
+```
+
+**Recovery:** Rename the polluted JSONL to `<id>.jsonl.reset.<iso-ts>`, mint a new session UUID in `sessions.json`, set `systemSent: false`, restart the gateway.
+
+**Prevention:** Configure `session.maintenance.mode: "enforce"` with aggressive `sessionRetention`; monitor tool-failure counts; don't let failed attempts accumulate unboundedly in a single session.
+
+#### `sessions_send` From Cron: Single 60s Sync, No Retry
+
+Retry-on-timeout patterns for cron-initiated `sessions_send` expose a sandbox-lifecycle race: the retry fires while the original sandbox is tearing down, and the envelope is silently dropped after a successful `status: "accepted"`.
+
+**Rule:** Issue a single `sessions_send` with `timeoutSeconds=60`, fail-fast on timeout, emit `failure_class=infra` to the observer. Do NOT implement a fire-and-forget retry path.
+
+**HEARTBEAT dedup caveat:** When multiple envelopes share a `run_id` but differ by `kind` (e.g., three distinct self-check kinds in one run), the dedup key MUST include `.kind` — otherwise peer envelopes collapse to `OK_DUPLICATE` and get dropped.
+
+#### Post-Deploy Session Clear + Warmup
+
+When a deploy modifies `HEARTBEAT.md` handlers (or any workspace file the main session caches), the running session continues applying the old logic until it is deleted. This manifests as CRITICAL alerts emitted with the pre-deploy format hours after the new handler landed.
+
+**Pattern for every deploy script:**
+```bash
+# 1. Delete the main session
+openclaw --profile "$PROFILE" sessions delete agent:main:main || true
+
+# 2. Warmup ping to recreate — non-fatal
+openclaw --profile "$PROFILE" agent --message "warmup after deploy $(date -u +%FT%TZ)" \
+  --timeout 30 || echo "[warn] warmup ping failed, continuing"
+```
+
+Both steps must be non-fatal (session may not exist pre-first-deploy; warmup may race gateway restart). The goal is best-effort freshness, not a hard gate.
+
 ### Delivery & Messaging
 
 #### Delivery Mode Leaks
@@ -936,6 +999,36 @@ Use `--channel telegram --to <chatId>` when registering cron jobs, not a combine
 Telegram enforces a 4096 character limit per message. Skills that produce long output (reports, lists, summaries) must instruct the agent to split into multiple messages.
 
 **Also:** The `message` tool target must be `telegram:<chatId>` (e.g., `telegram:5906288273`), not a symbolic name like "operator". Specify the exact tool call format in SKILL.md to prevent the agent from guessing.
+
+#### Delivery-Mode Audit Whitelist
+
+HEARTBEAT-style cron delivery audits that flag `lastDelivered: false` as a failure will false-alarm on every job intentionally set to `delivery.mode: "none"` (those deliver via the sandbox `message` tool, not the cron-level channel). Noise from these false alarms masks real delivery failures.
+
+**Rule:** Delivery audits must skip jobs where `delivery.mode == "none"`. Only jobs with `delivery.mode` in (`announce`, `direct`) are eligible for the `lastDelivered` check.
+
+```
+6b. For each cron job:
+    if delivery.mode == "none": skip (delivers via message tool from sandbox)
+    else if lastDelivered == false and lastRunAt > threshold: flag
+```
+
+#### Handler Side-Effects BEFORE ACK-Return
+
+In HEARTBEAT handler flows (`SELF_CHECK_LOG`, `EVOLUTION_LOG_APPEND`, and similar runtime envelopes), the agent may return the ACK envelope and terminate the turn before post-ACK steps execute. Any side effect placed AFTER the ACK-return step — Telegram alerts, ledger writes, incident escalation — can be silently skipped.
+
+**Rule:** All side effects must run BEFORE the ACK-return step. In handler markdown, explicitly number steps and place alerts/writes in a step whose number is LOWER than the ACK-return step.
+
+```markdown
+## SELF_CHECK_LOG handler
+Step 1: parse envelope
+Step 2: write to SYSTEM_LOG.jsonl
+Step 3: if failure_class in (regressed, source_degraded) AND confidence >= medium:
+         send Telegram alert to operator  <-- side effect BEFORE ACK
+Step 4: write daily dedup ledger entry    <-- side effect BEFORE ACK
+Step 5: return ACK_OK envelope            <-- terminates turn
+```
+
+Verify by auditing each handler: no critical write should appear after the return-step.
 
 ### Cron & Scheduling
 
@@ -984,6 +1077,82 @@ Config-cache refresh operations can fail with `node ENOENT` errors referencing a
 
 **Fix:** Build retry logic (2-3 attempts with 1s backoff) into any script that refreshes the config cache. Do not treat the first failure as fatal.
 
+#### Main-Session `systemEvent` Crons Need `wakeMode: "next-heartbeat"`
+
+Cron jobs with `sessionTarget: "main"` and `wakeMode: "now"` poll `runHeartbeatOnce` for up to 120s. When the main session is busy (operator DM turn in flight), every such poll returns `skipped: requests-in-flight` — serializing ALL infra crons behind the operator interaction. Isolated cron jobs are unaffected; this becomes a strong diagnostic signal.
+
+**Rule:** For every cron targeting main session (config-cache refresh, hourly checkpoint, daily backup, memory init reminders), set `wakeMode: "next-heartbeat"` — it defers to the next scheduled heartbeat tick instead of polling.
+
+```json
+{
+  "sessionTarget": "main",
+  "wakeMode": "next-heartbeat"
+}
+```
+
+**Heartbeat detection:** Flag a stuck main-session cron lane when `(now - lastRunAtMs) > 1.5x interval` AND (`consecutiveErrors > 0` OR `runningAtMs` stale >10 min). The alert should include an isolated-lane comparison ("isolated healthy; main stuck") for fast triage.
+
+#### Exclude `cron/` from Rsync Between Environments
+
+Each environment owns its own runtime cron snapshot via the hourly checkpoint (gateway → `workspace/cron/jobs.json`). If `promote.sh` rsyncs `cron/` from DEV to PROD, a stale DEV snapshot can silently overwrite PROD schedules — causing DOW drift, schedule regressions, or re-enabling disabled shadow jobs. No alert fires until the heartbeat detects stale config-cache hours later.
+
+**Rule:** Add `--exclude='cron/'` to all cross-env rsync. `sync-cron-from-config.sh` (config-as-authority) reconciles schedules; git is NOT authoritative for runtime cron snapshots.
+
+```bash
+rsync -av --delete \
+  --exclude='cron/' --exclude='memory/' --exclude='.openclaw/' \
+  --exclude='SYSTEM_LOG.md' --exclude='SYSTEM_LOG.jsonl' \
+  ~/.openclaw-dev/workspace/ ~/.openclaw/workspace/
+```
+
+#### Silent-Skip → Loud-Fail for Reconciliation Scripts
+
+The most pernicious drift mode in auto-fix loops: a reconciliation script (e.g., `sync-cron-from-config.sh`, called hourly) hits a guard condition, logs nothing, and `exit 0`s. The auto-fix loop reports success every cycle while the underlying state rots for days.
+
+**Rule:** Any reconciliation script that skips due to a guard condition must:
+1. Write a clear message to stderr
+2. Exit with a distinct non-zero code (e.g., `2` for "skipped, not an error but not a fix")
+3. Leave an audit trail (append to a log file)
+
+```bash
+if (( now_ms - cached_at_ms > STALE_THRESHOLD_MS )); then
+  echo "[sync-cron] skipping: cache age $(( (now_ms - cached_at_ms)/60000 ))min > threshold" >&2
+  echo "$(date -u +%FT%TZ) skip cache-stale" >> ~/.openclaw/logs/sync-cron.log
+  exit 2
+fi
+```
+
+The caller (hourly checkpoint, CI, operator) treats exit 2 as "needs attention" rather than invisible success.
+
+#### Config Cache Freshness: `cachedAt` vs `lastUpdated`
+
+Config-cache JSON blobs typically carry two timestamps:
+
+| Field | Semantics | Use for |
+|-------|-----------|---------|
+| `cachedAt` | When the cache was last refreshed from the source | Freshness guards in sync scripts |
+| `lastUpdated` | When the underlying config was last modified | Change detection / invalidation |
+
+A sync script that compares `Date.now()` against `lastUpdated` to decide "is the cache fresh?" will permanently block when the config is stable but the cache is live-refreshed — because `lastUpdated` does not advance, even though the cache is current.
+
+**Rule:** Freshness checks read `cachedAt`. For transition safety across deployments that predate `cachedAt`, fall back: `effective_ms = cachedAt ?? lastUpdated`.
+
+#### Cross-Profile Cron Health Validator
+
+Multi-profile deployments (DEV + PROD, or multiple agents) need a single ad-hoc health check that catches silent degradation between deploys. Individual cron metadata can report `lastStatus: "success"` while 401 auth errors accumulate invisibly in session logs.
+
+**Pattern — `validate-crons.sh`:**
+1. For each profile, SSH to the droplet and run `openclaw --profile $P cron list --json`
+2. Classify each job's state:
+   - **STALE**: `lastRunAt` older than 2× cadence
+   - **AUTH**: recent session log contains `401` / `403` / `unauthorized`
+   - **INFRA**: consecutive timeouts or `ENOTFOUND`
+   - **DURATION_CREEP**: avg runtime >1.5× 7-day baseline
+3. Summarize per profile (counts by class)
+4. Exit 1 on any **RED** state; non-fatal (exit 0) on **WARN**; normal exit on all-green
+
+Run manually post-deploy and optionally from a `cron`-style monitor on a separate host. The key property: *one script* validates *all profiles*, so drift between profiles is visible at a glance.
+
 ### Memory
 
 #### Memory Init: Append Not Overwrite
@@ -997,6 +1166,23 @@ Isolated cron sessions writing to `memory/SYSTEM_LOG.md` or daily memory files c
 Only files in the `memory/` directory are indexed for `memory_search`. Root-level workspace files (e.g., custom config dumps, data files, signal files) do not appear in search results even though they are readable from the workspace.
 
 **Fix:** For persistent searchable state, write to the `memory/` subdirectory. For data that must remain at workspace root, reference it by explicit file path in skills rather than relying on `memory_search` to surface it.
+
+#### SYSTEM_LOG: Split Telemetry from Ops Text
+
+Deployments with both machine-readable self-check envelopes AND text-heavy ops writes (BOOT, HEALTH, BACKUP, INCIDENT) end up parsing SYSTEM_LOG.md as JSON and tripping over the text. Typical symptom: an analyzer reports a high "malformed" rate because legitimate text log lines are being (incorrectly) parsed as JSON.
+
+The collision gets worse as writers scale: text writers out-produce the reader's age-out logic, and pseudo-JSON envelopes emitted by different skills drift in schema.
+
+**Split pattern:**
+
+| File | Format | Writers | Readers |
+|------|--------|---------|---------|
+| `memory/SYSTEM_LOG.jsonl` | Newline-delimited JSON | Self-check envelope handler ONLY | Harness/observer, analyzers |
+| `memory/SYSTEM_LOG.md` | Free-form text | Cron skills, backup/incident/boot writers | Operator |
+
+**Migration safety:** On first run after split, the reader may find the `.jsonl` file missing. Emit `source_missing: true` in the wrapper output rather than failing the check — the file will be created by the next self-check write.
+
+**Rsync:** Exclude both files (`--exclude='SYSTEM_LOG.md' --exclude='SYSTEM_LOG.jsonl'`) to prevent env-to-env contamination.
 
 ### Deployment & Upgrades
 
@@ -1100,6 +1286,102 @@ If count is 0, directly scp the stale files and restart the gateway. Add this po
 Grepping session JSONL files for ACK outcomes (e.g., `OK_APPENDED`, `ERR_PARSE`) produces false positives because preloaded SKILL.md template text contains the same string literals. Template text appears in assistant `toolCall` message content, while real ACKs appear in separate `toolResult` blocks.
 
 **Fix:** Pair `sessions_send` `toolCall` blocks with their corresponding `toolResult` by `toolCallId` to distinguish real runtime ACKs from template text. Fire-and-forget sends use `status: "accepted"` (no ACK body). Timeout sends appear in `toolCall` with `timeoutSeconds` but have no matching `toolResult`.
+
+#### `deploy.sh --ref <sha|branch>` for DEV Feature Testing
+
+Promotion flows often assume "DEV = tip of main", which prevents testing a feature branch before merge. Support an explicit `--ref` parameter on `deploy.sh` so DEV can validate arbitrary git refs without forcing an early merge. PROD must reject non-main refs.
+
+**Shape:**
+```bash
+deploy.sh --env dev --ref feature/my-branch   # OK: git checkout --detach
+deploy.sh --env prod --ref feature/my-branch  # ERROR: PROD refuses non-main
+deploy.sh --env prod                          # OK: uses current main HEAD
+```
+
+**Caveat:** Do NOT `git clean -fd` after the ref switch — this wipes untracked but live runtime state (`memory/` daily logs, `cron/jobs.json` snapshots). Only clean what you intentionally gitignored.
+
+#### Custom MCP Service Deployment
+
+When shipping a custom MCP service alongside the gateway (e.g., a per-agent build executor), a naive deploy can "false-green": the service process comes up, but the token baked into the gateway's `.env` doesn't match the token configured in the MCP service, and every agent call returns 401.
+
+**Pattern:** fingerprint the token at three locations, then fail-fast if any pair disagrees.
+
+| Location | How to read |
+|----------|-------------|
+| Deploy-time secret | `sha256sum < .secrets/mcp-token` |
+| Gateway systemd env | `systemctl --user show openclaw-gateway-$PROFILE -p Environment` |
+| MCP service | `curl http://localhost:$MCP_PORT/healthz` → returns `{tokenFingerprint: "..."}` |
+
+If any fingerprint differs, abort the deploy.
+
+**Packaging:**
+- Bundle the service with `esbuild` (CJS output), externalizing `node_modules/@yourorg/*` so template packages stay hot-reloadable
+- Bake `version` and `GIT_COMMIT` at bundle time
+- Install as a user-level systemd unit; don't cold-start on failure — do a preflight boot check first and fail the deploy if startup takes >N seconds
+- Validate post-deploy by sending an agent message that triggers an `exec curl` MCP ping, and assert the response embeds the fingerprint
+
+#### Multi-Profile Config Parity
+
+When running DEV and PROD (or multiple agent profiles) on the same host, config drift between profiles is a dominant source of "works in DEV, fails in PROD" incidents. Teams instinctively maintain DEV and duplicate the values into a bootstrap/deploy script — then the two copies drift.
+
+**Rules:**
+1. Single source of truth for every config value. Store the canonical value in one well-known file (e.g., `deploy/config.yml` or `plan.md`), read it in both the bootstrap AND deploy scripts. Never copy values between scripts.
+2. Validate both profiles end-to-end before marking a phase complete. DEV is a production test environment for PROD; if DEV is skipped, PROD will discover the regression.
+3. Diff full config between profiles on every deploy:
+   ```bash
+   diff <(openclaw --profile dev config get .) <(openclaw --profile prod config get .)
+   ```
+   Expected diffs are narrow (ports, hostnames, channel IDs). Unexpected diffs must be investigated before the deploy proceeds.
+
+#### Post-Deploy Marker Verification (Mandatory)
+
+This extends "Deploy Rsync Silent SKILL.md Skip" above: the belt-and-suspenders rule is that EVERY deploy that edits workspace files (skills, HEARTBEAT, identity files) must post-deploy grep for a known marker. No exceptions — rsync's success signal is unreliable.
+
+**Pattern:** bake a short, unique marker (e.g., a new section name or a version comment) into every deploy, and verify:
+```bash
+MARKER="# deploy-$(git rev-parse --short HEAD)"
+grep -q "$MARKER" ~/.openclaw/workspace/skills/**/SKILL.md || {
+  echo "[deploy] FAIL: marker not found; rsync silently skipped" >&2
+  exit 1
+}
+```
+
+Make this gate fatal, not advisory. One silent skip is enough to erode confidence in the deploy pipeline.
+
+#### SSH ControlMaster for Fleet-Ops Scripts
+
+`ufw` on Ubuntu defaults to rate-limiting SSH at 6 connections / 30s. Scripts that fan out many small SSH commands (validators, fingerprinters, multi-profile deploys) trip this limit and start failing opaquely with `Connection refused` partway through.
+
+**Fix:** Enable `ControlMaster` in `~/.ssh/config` on the control host:
+```
+Host droplet-*
+  ControlMaster auto
+  ControlPath /tmp/ssh-%r@%h:%p
+  ControlPersist 10m
+```
+
+One TCP/SSH handshake; all subsequent `ssh droplet-prod …` invocations multiplex over it. Alternative: batch remote commands into a single `ssh` call.
+
+#### `fnm default` Symlink Over Hardcoded Node Path in systemd
+
+Hardcoding `/home/user/.local/share/fnm/node-versions/v24.3.0/bin/node` into a systemd unit breaks the next `fnm install --lts` upgrade. Use the `fnm default` alias symlink instead:
+
+```
+ExecStart=/home/user/.local/share/fnm/aliases/default/bin/node /path/to/bin.js
+```
+
+This survives node version bumps. After `openclaw update` or any Node bump, re-run:
+```bash
+openclaw --profile $P gateway install --force
+systemctl --user daemon-reload
+systemctl --user restart openclaw-gateway-$P
+```
+
+#### Canonical Casing for Log-Marker Greps
+
+When HEARTBEAT (or any monitor) greps for a log-line marker emitted by another script, case matters. One typical incident: writer script emits `— Backup completed`; heartbeat greps for `— backup`; heartbeat reports "backup missing" for days.
+
+**Rule:** Declare canonical casing for every inter-script marker in HEARTBEAT.md (or a shared `CONVENTIONS.md`). Writers and readers both reference that canonical form. Add a test assertion — grep the writer script for the writer-side string AND grep the reader for the reader-side string; fail CI if they diverge.
 
 ---
 
@@ -1226,3 +1508,31 @@ For agents running repeated skills, HEARTBEAT.md should detect failure patterns 
 **Grace period:** Suppress alerts for 3 hours after gateway restart to avoid false alarms during startup and session warm-up.
 
 **Threshold tuning:** Start with 3 failures in 7 days. Tighten for critical skills (2 in 3 days), loosen for flaky external dependencies (5 in 7 days).
+
+### Harness Self-Eval Escalation Pattern
+
+Self-evaluating agents (skills that score their own outputs and emit a result envelope) surface a gap the basic "N failures → alert" pattern misses: the agent can self-identify regressions that never cross any single check's failure threshold. Three complementary rules close that gap.
+
+**Rule 1 — SKIP-streak watchdog.** Alongside the failure-streak rule, count consecutive `SKIP` outcomes (the skill couldn't even run because upstream inputs were missing or malformed). Alert on `≥3 SKIPs` within 7 days for the same check. SKIP streaks indicate silent input-source degradation — the consuming skill looks healthy but produces nothing.
+
+**Rule 2 — Source-coverage floor.** For skills that ingest multiple independent sources (e.g., compiling signals from N feeds), track a `source_coverage` field: `passed / total`. Fail the outer run if `passed < coverage_floor` (e.g., `<8/10`), independent of whether the LLM's decision was correct. Prevents a low-health input set from masking a bad decision with a plausible output.
+
+**Rule 3 — Evolution-log mid-turn escalation.** When the self-eval envelope reports `outcome ∈ (regressed, source_degraded)` AND `confidence ∈ (medium, high)`, fire the escalation (Telegram DM, incident ledger write) BEFORE the handler returns ACK. Post-ACK logic can be skipped (see §13 "Handler Side-Effects BEFORE ACK-Return").
+
+**Dedup ledger.** A single daily ledger, keyed by `(skill, failure_sig)`, prevents alert storms from the same regression signature. `failure_sig` is a short hash of the envelope's diagnostic fields (not the timestamp or run_id).
+
+**Envelope shape (reference):**
+```json
+{
+  "skill": "compile-signals",
+  "run_id": "2026-04-19T07:00:00Z",
+  "kind": "self-check",
+  "outcome": "regressed",
+  "confidence": "high",
+  "source_coverage": { "passed": 6, "total": 10 },
+  "failure_class": "source_degraded",
+  "failure_sig": "sha1:7e2a…"
+}
+```
+
+Handler emits `OK_APPENDED` AFTER it has routed the envelope to alerts, the ledger, and `SYSTEM_LOG.jsonl`. If the `source_coverage.passed < floor` check triggers, the handler emits `REGRESSION_ESCALATED` and includes the incident packet in the alert body.

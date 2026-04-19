@@ -876,6 +876,12 @@ Edit `~/.openclaw-dev/openclaw.json` — change these two settings:
 > **SSH tunnel for DEV dashboard:** `ssh -L 19001:localhost:19001 clawuser@YOUR_DROPLET_IP` → open `http://localhost:19001`.
 >
 > **Promotion scripts:** For production deployments with LOCAL/DEV/PROD environments, see `reference-openclaw-design-patterns.md` Section 9 for the full promotion workflow (`promote.sh`, `promote-dev.sh`, `promote-skill.sh`, `auto-promote.sh`, `rollback.sh`).
+>
+> **Gotcha — post-deploy marker grep:** `rsync` can report success while `SKILL.md` files on the target retain stale content. Every deploy must bake a unique marker and verify it: `ssh $HOST 'grep -q "$MARKER" ~/.openclaw/workspace/skills/**/SKILL.md' || exit 1`. Make the check fatal, not advisory. Reference: `reference-openclaw-design-patterns.md` §13 → "Deploy Rsync Silent SKILL.md Skip" and "Post-Deploy Marker Verification (Mandatory)".
+>
+> **Gotcha — exclude runtime state from rsync:** `cron/` (per-env snapshot), `memory/` (agent-written), `SYSTEM_LOG.md` and `SYSTEM_LOG.jsonl` (agent-written) must be excluded from every cross-env rsync. Rsyncing a stale `cron/jobs.json` from DEV over PROD silently reverts schedules; the heartbeat only notices hours later when a config-cache cron doesn't fire.
+>
+> **Gotcha — post-deploy session warmup:** Workspace file edits (HEARTBEAT.md, SOUL.md, skills) do not take effect in a running main session — the gateway caches the session. After every deploy, your deploy script should `openclaw sessions delete agent:main:main` and then send a warmup ping (both non-fatal) to force a fresh session with the new instructions.
 
 **3.9 — Build the Sandbox Docker Image**
 

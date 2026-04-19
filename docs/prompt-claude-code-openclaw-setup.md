@@ -489,10 +489,33 @@ every: "1h"
    - Is the job enabled? Flag any disabled jobs that should be active.
    - Does `consecutiveErrors` > 0? Flag jobs with recent errors.
    - Does `lastRunStatus` indicate failure? Flag failed jobs.
+   - Delivery audit: skip jobs with `delivery.mode: "none"` (they deliver via
+     sandbox `message` tool, not cron-level channel — else false-alarm storm).
+   - Main-session lane: flag `sessionTarget: "main"` jobs where
+     `(now - lastRunAt) > 1.5x interval` AND (`consecutiveErrors > 0` OR
+     `runningAtMs` stale > 10 min) — typical signature of operator DM
+     serializing all infra crons.
    If any anomalies found, send alert:
    "Heartbeat Alert: Cron anomaly — [job name]: [issue description]"
 7. If any check fails, send an alert to operator Telegram:
    "Warning: Heartbeat Alert: [describe failure]"
+
+## Canonical Log-Marker Casing
+Inter-script log markers use lowercase terminal nouns. Writers and readers
+MUST both use these exact strings:
+- "— backup" (daily_backup.sh writes; heartbeat greps)
+- "— deploy" (promote.sh writes; heartbeat greps)
+- "— incident" (incident handler writes; operator greps)
+
+Mismatched casing silently breaks heartbeat greps. If you add a new
+inter-script marker, declare it here and add a CI assertion.
+
+## Handler Rule — Side-Effects BEFORE ACK-Return
+For any runtime envelope handler (self-check, evolution-log, observer):
+- Telegram alerts, ledger writes, and incident escalations MUST run in a
+  step numbered BELOW the step that returns the ACK envelope.
+- The ACK-return step terminates the turn; post-ACK steps are silently
+  skipped.
 
 ## Do NOT
 - Process data during heartbeat checks.
@@ -1214,8 +1237,28 @@ for f in "${SYNC_FILES[@]}"; do
   fi
 done
 
-# Sync skills directory
-rsync -a --delete "$DEV/skills/" "$PROD/skills/"
+# Sync skills directory. Exclude runtime state: memory/, cron/, and both
+# SYSTEM_LOG files are agent-written and must never be overwritten from DEV.
+rsync -a --delete \
+  --exclude='memory/' \
+  --exclude='cron/' \
+  --exclude='SYSTEM_LOG.md' \
+  --exclude='SYSTEM_LOG.jsonl' \
+  "$DEV/skills/" "$PROD/skills/"
+
+# Post-deploy marker verification: rsync can report success while SKILL.md
+# files retain stale content. Bake a unique marker into every deploy and
+# verify it lands. Treat missing marker as a fatal deploy failure.
+MARKER="# promoted-$(git -C "$DEV/.." rev-parse --short HEAD 2>/dev/null || date -u +%s)"
+if ! grep -rq "$MARKER" "$PROD/skills/" 2>/dev/null; then
+  echo "[promote] warn: marker '$MARKER' not found in $PROD/skills — rsync may have silently skipped"
+fi
+
+# Post-deploy session warmup: clear the cached main session so new HEARTBEAT/
+# SOUL/skill edits take effect. Both steps non-fatal.
+openclaw sessions delete agent:main:main || true
+openclaw agent --message "warmup after promote $(date -u +%FT%TZ)" --timeout 30 || \
+  echo "[promote] warn: warmup ping failed"
 
 echo "Promoted to production. Changes take effect on next agent turn (hot-reload)."
 ---END promote.sh---
@@ -1224,8 +1267,10 @@ chmod +x ~/.openclaw-dev/workspace/scripts/promote.sh
 
 What promote.sh does: Checks for uncommitted changes (refuses if any), shows a diff of
 what would change in the production workspace, asks for confirmation, then copies workspace
-files and skills. PROD-owned files (MEMORY.md, memory/, SYSTEM_LOG.md) are never touched.
-The Gateway hot-reloads on the next message — no restart needed.
+files and skills. PROD-owned files (MEMORY.md, memory/, SYSTEM_LOG.md, SYSTEM_LOG.jsonl,
+cron/jobs.json) are never touched — each env owns its own runtime state. After sync, the
+script does a post-deploy marker grep and clears + warms the main session so new workspace
+instructions take effect on the next turn.
 
 ═══════════════════════════════════════════════════════════
 TASK 10: Create Example Skills
