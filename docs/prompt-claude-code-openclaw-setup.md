@@ -6,7 +6,7 @@
 >
 > **Prerequisites assumed complete:**
 > - DigitalOcean Droplet (Ubuntu 24.04) provisioned with SSH key auth
-> - `clawuser` non-root user created with sudo access
+> - `[NONROOT_USER]` non-root user created with sudo access
 > - SSH hardened (key-only, root login disabled)
 > - UFW firewall active (22/tcp only)
 > - Automatic security updates enabled
@@ -21,7 +21,7 @@
 
 ## THE PROMPT
 
-Paste the following into Claude Code (inside a tmux session on your Droplet as `clawuser`):
+Paste the following into Claude Code (inside a tmux session on your Droplet as `[NONROOT_USER]`):
 
 ---
 
@@ -38,6 +38,7 @@ CRITICAL RULES:
 I will give you my business values in the format below. Ask me for any I haven't provided.
 
 BUSINESS VALUES (I'll fill these in — leave as placeholders if I haven't provided yet):
+- Non-Root Username: ___  (the Linux user OpenClaw runs as on the droplet; substitute this wherever you see [NONROOT_USER] in commands and paths)
 - Agent Name: ___
 - Agent Purpose: ___
 - Agent Role: ___
@@ -110,7 +111,7 @@ Phase 2.2 — Bind Gateway to localhost:
 
 Phase 2.3 — SSH tunnel instructions:
 7. Tell me the SSH tunnel command I need to run from my LOCAL machine:
-   ssh -L 18789:localhost:18789 clawuser@[DROPLET_IP]
+   ssh -L 18789:localhost:18789 [NONROOT_USER]@[DROPLET_IP]
    Then: open http://localhost:18789 in browser.
    🛑 HUMAN GATE: This is a local machine action. Pause and confirm I can access the dashboard.
 
@@ -367,7 +368,7 @@ Phase 3.3–3.6 — Create these files with EXACT content:
 
 ## Tool Access
 - **Enabled:** memory_search, memory_get[IF TASK 3 WAS COMPLETED: , gog (Google Sheets — designated sheets only)]
-- **Exec:** Available, restricted by allowlist (`/home/clawuser/scripts/safe-git.sh`[IF TASK 3 WAS COMPLETED: , `/home/clawuser/.local/bin/gog`] only)
+- **Exec:** Available, restricted by allowlist (`/home/[NONROOT_USER]/scripts/safe-git.sh`[IF TASK 3 WAS COMPLETED: , `/home/[NONROOT_USER]/.local/bin/gog`] only)
 - **Disabled:** email_*, browser_*, ssh_*, gateway_config, gdrive_*, gmail_*
 - **Requires Confirmation:** Any record deletion or status change,
   any new CRON job creation, any message to a group chat
@@ -875,7 +876,7 @@ Using a different port (18790) prevents conflicts with the always-on PROD Gatewa
 channels prevents DEV from accidentally responding to real users.
 Start DEV with: openclaw start --dev
 Stop when done testing.
-SSH tunnel for DEV dashboard: ssh -L 18790:localhost:18790 clawuser@[DROPLET_IP] → open http://localhost:18790.
+SSH tunnel for DEV dashboard: ssh -L 18790:localhost:18790 [NONROOT_USER]@[DROPLET_IP] → open http://localhost:18790.
 
 LOCAL Environment (Optional — for rapid iteration):
 Instead of editing files in ~/.openclaw-dev/workspace/ and promoting, you can symlink the
@@ -893,7 +894,7 @@ Phase 3.9 — The sandbox config in openclaw.json references a Docker image. Bui
 
 1. Install Docker if not present:
    sudo apt install -y docker.io
-   sudo usermod -aG docker clawuser
+   sudo usermod -aG docker [NONROOT_USER]
 
 2. Build the sandbox image (use sg to run with docker group in current session — do NOT use newgrp):
    sg docker -c "cd ~/.openclaw && bash scripts/sandbox-setup.sh"
@@ -946,7 +947,7 @@ Phase 3.11 — Create ~/.openclaw/exec-approvals.json with this EXACT content:
 {
   "version": 1,
   "socket": {
-    "path": "/home/clawuser/.openclaw/exec-approvals.sock",
+    "path": "/home/[NONROOT_USER]/.openclaw/exec-approvals.sock",
     "token": "${EXEC_APPROVALS_SOCKET_TOKEN}"
   },
   "defaults": {
@@ -964,10 +965,10 @@ Phase 3.11 — Create ~/.openclaw/exec-approvals.json with this EXACT content:
       "allowlist": [
         [IF TASK 3 WAS COMPLETED — include this entry; otherwise omit]
         {
-          "pattern": "/home/clawuser/.local/bin/gog"
+          "pattern": "/home/[NONROOT_USER]/.local/bin/gog"
         },
         {
-          "pattern": "/home/clawuser/scripts/safe-git.sh"
+          "pattern": "/home/[NONROOT_USER]/scripts/safe-git.sh"
         }
       ]
     }
