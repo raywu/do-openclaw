@@ -1,5 +1,15 @@
 # Multi-Agent Prompt: Set Up OpenClaw on DigitalOcean
 
+> ## ⚠️ DEPRECATED (as of 2026-04-19)
+>
+> **Use [`prompt-claude-code-openclaw-setup.md`](./prompt-claude-code-openclaw-setup.md) instead.**
+>
+> This multi-agent variant is no longer kept current. The single-agent prompt is the canonical setup path, receives every learnings harvest, and covers the same 15 task blocks with the same security posture — without the Review/Research subagent scaffolding. The orchestration overhead here did not pay for itself on a one-shot install prompt.
+>
+> This file is retained (not deleted) so existing links don't 404. Do not add new content here; submit changes to the single-agent prompt.
+>
+> ---
+
 > **What this is:** A prompt to paste into Claude Code on your DigitalOcean Droplet. Like the single-agent version, it walks through 15 task blocks with human gates. The difference: this version uses Claude Code's `Task` tool to spawn two specialized subagents — a **Review Agent** that validates outputs after each task block, and a **Research Agent** that investigates errors at failure-prone steps.
 >
 > **How it works:**

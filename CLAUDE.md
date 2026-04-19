@@ -13,7 +13,7 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **`prompt-claude-code-openclaw-setup.md`** — Generic Claude Code prompt for guided setup (mirrors the setup guide)
 
 **Other:**
-- **`prompt-multi-agent-openclaw-setup.md`** — Multi-agent orchestration prompt (pre-v3, not yet updated)
+- **`prompt-multi-agent-openclaw-setup.md`** — **DEPRECATED (2026-04-19).** Use `prompt-claude-code-openclaw-setup.md` instead. File retained for link stability; do not add new content.
 - **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration (auto-migrate), configuration patterns, operational learnings, A2A architecture
 - **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
@@ -61,6 +61,22 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **One-shot auto-trigger**: `openclaw cron add --at 1m --delete-after-run` for event-driven skill execution; use atomic `UPDATE...RETURNING` for claim-before-act
 - **Deploy rsync silent skip**: rsync can report success while SKILL.md files stay stale; always post-deploy grep for a known marker
 - **`sessions_send` ACK verification**: grepping session JSONL for ACK strings gives false positives from template text; pair by `toolCallId` to distinguish real ACKs
+- **Main-session cron `wakeMode`**: cron with `sessionTarget: "main"` must use `wakeMode: "next-heartbeat"` — `wakeMode: "now"` polls for 120s and serializes all infra crons behind in-flight operator DMs
+- **Config cache freshness**: sync scripts compare `cachedAt` (fresh-fetch ms), not `lastUpdated` (DB-mod ms); use `cachedAt ?? lastUpdated` fallback for transition safety
+- **Cron snapshot per-env**: each env owns its own `workspace/cron/jobs.json` via hourly checkpoint — add `--exclude='cron/'` to all cross-env rsync (promote.sh, deploy.sh)
+- **Silent-skip → loud-fail**: reconciliation scripts (`sync-cron-from-config.sh` et al.) must `echo >&2` + `exit 2` on guard-skip, never `exit 0`. Invisible auto-fix loops are the #1 cause of undetected drift
+- **Delivery-mode audit whitelist**: cron delivery audits must skip jobs with `delivery.mode: "none"` (they deliver via sandbox `message` tool, not cron-level channel) — else false-alarm storm masks real failures
+- **`deploy.sh --ref <sha|branch>`**: allow DEV to test arbitrary git refs; PROD rejects non-main. Never `git clean -fd` after ref switch (wipes runtime `memory/` / `cron/` state)
+- **Post-deploy session warmup**: every deploy script must `sessions delete agent:main:main` + send a warmup ping (both non-fatal) to refresh the cached handler after HEARTBEAT.md changes
+- **Exec-approvals bare-name parity**: allowlist BOTH bare name (`curl`) and absolute path (`/usr/bin/curl`) — `exec` uses `execFile` without PATH resolution; also add `ls`, `cat`, `env`, `grep`, `printenv` for self-diagnosis
+- **`fnm default` symlink in systemd**: point systemd `ExecStart` at `~/.local/share/fnm/aliases/default/bin/node` (not a pinned version); survives `fnm install --lts`
+- **SYSTEM_LOG split**: `SYSTEM_LOG.jsonl` for self-check envelopes (machine-readable), `SYSTEM_LOG.md` for text ops writers (BOOT/BACKUP/INCIDENT); exclude both from rsync
+- **Handler side-effects BEFORE ACK-return**: in HEARTBEAT handlers, Telegram alerts / ledger writes / incident escalations MUST run in a step numbered below the ACK-return step — post-ACK logic can be silently skipped
+- **Post-deploy marker grep (mandatory)**: every deploy that edits workspace files bakes a unique marker and grep-verifies it post-rsync; rsync's success signal is unreliable
+- **SSH ControlMaster**: UFW rate-limits SSH at 6 conn / 30s. Fleet-ops scripts enable `ControlMaster auto` in `~/.ssh/config` or batch commands into one `ssh` call
+- **Canonical log-marker casing**: declare canonical casing for inter-script log markers in HEARTBEAT.md; assert writer + reader agree (CI check) — mismatched casing silently breaks heartbeat greps
+- **Cross-profile cron validator**: standalone `validate-crons.sh` SSHs each profile, runs `cron list --json`, classifies state (stale / auth / infra / duration-creep), exits 1 on RED — catches silent 401 streaks
+- **Agent hallucination check**: for operator DM sessions demanding side effects, grep active session JSONL for a `toolCall` block between operator msg and agent reply; absence = hallucination — reset session JSONL + mint new UUID
 
 ## Key Concepts
 
