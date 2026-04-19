@@ -16,27 +16,25 @@ OpenClaw ships with excellent platform docs and a marketplace 1-Click image. Wha
 
 ## How to use it
 
-You have two paths. Both target **Ubuntu 24.04 on a DigitalOcean Premium AMD droplet** with Claude Code already installed.
-
-### Path A — Follow the guide yourself
+Paste this prompt into Claude or Codex on your workstation. It walks you through the entire deployment — droplet provision, hardening, OpenClaw install, workspace setup — pausing at every decision point for your input.
 
 ```text
-https://github.com/raywu/do-openclaw/blob/master/docs/openclaw-setup-guide.md
+Read the OpenClaw + DigitalOcean setup guide at
+https://raw.githubusercontent.com/raywu/do-openclaw/master/docs/openclaw-setup-guide.md
+
+Walk through it with me end to end. Interview me for the values I need
+to provide (droplet size, agent identity, channel IDs, timezone, etc.).
+Help me provision and harden a DigitalOcean droplet first, then install
+OpenClaw and configure the workspace on it. Pause at every decision
+point and every security-sensitive step. Do not improvise file contents
+— every workspace file has exact content that matters.
+
+Once the droplet is up and Claude Code is running on it, also reference
+https://raw.githubusercontent.com/raywu/do-openclaw/master/docs/prompt-claude-code-openclaw-setup.md
+for the on-droplet task-block automation.
 ```
 
-Work through Phase 1 (provision + harden) and Phase 2 (install + configure OpenClaw) in order. The guide uses `[PLACEHOLDER]` tokens for anything you need to customize (sheet IDs, channel IDs, dates). Expect 60–90 minutes for a fresh droplet.
-
-### Path B — Let Claude Code drive it
-
-SSH into your droplet as the non-root user, start a tmux session, launch `claude`, and paste this single message:
-
-```text
-Read the do-openclaw deployment scaffold at https://github.com/raywu/do-openclaw and use it to set up OpenClaw on this droplet.
-
-Start with docs/prompt-claude-code-openclaw-setup.md — follow the task blocks in order, stop at every human gate (marked 🛑), and list all [PLACEHOLDER] tokens you need me to fill in. Do not improvise file contents — every workspace file has exact content that matters for security.
-```
-
-Claude Code reads the prompt doc, walks through the 15 task blocks with you, creates workspace files verbatim, and pauses at each gate so you can verify before it moves on.
+No clone required — WebFetch reads the raw URLs directly. Target host is Ubuntu 24.04 on a DigitalOcean Premium AMD droplet; the prompt expects ~60–90 minutes for a fresh install.
 
 ### What happens after setup
 
