@@ -5,7 +5,7 @@ A production-hardened deployment guide for running [**OpenClaw**](https://docs.o
 This is a **documentation-only** repo: no application code, no build system, no tests. The artifacts are:
 
 - a step-by-step manual setup guide you can follow yourself
-- a copy-pasteable prompt that hands the setup to Claude Code running on the droplet
+- a copy-pasteable prompt that hands the setup to a coding agent (Claude Code or Codex) running on the droplet
 - reference docs for architecture, configuration, and ~60 operational learnings harvested from live deployments
 
 ## Why it exists
@@ -29,7 +29,8 @@ OpenClaw and configure the workspace on it. Pause at every decision
 point and every security-sensitive step. Do not improvise file contents
 — every workspace file has exact content that matters.
 
-Once the droplet is up and Claude Code is running on it, also reference
+Once the droplet is up and a coding agent (Claude Code or Codex) is
+running on it, also reference
 https://raw.githubusercontent.com/raywu/do-openclaw/master/docs/prompt-claude-code-openclaw-setup.md
 for the on-droplet task-block automation.
 ```
@@ -50,11 +51,11 @@ Then: start harvesting your own learnings. Every production deployment finds fai
 | Path | What it is |
 |------|------------|
 | [`docs/openclaw-setup-guide.md`](docs/openclaw-setup-guide.md) | Manual walkthrough for Ubuntu 24.04 on DigitalOcean — Phase 1 (provision/harden) + Phase 2 (install) + Phase 3 (workspace files) |
-| [`docs/prompt-claude-code-openclaw-setup.md`](docs/prompt-claude-code-openclaw-setup.md) | Single prompt for Claude Code — 15 task blocks, human gates, exact-content workspace templates |
+| [`docs/prompt-claude-code-openclaw-setup.md`](docs/prompt-claude-code-openclaw-setup.md) | Single prompt for a coding agent on the droplet (Claude Code or Codex) — 15 task blocks, human gates, exact-content workspace templates. Filename is historical; works for either agent. |
 | [`docs/references/reference-openclaw-design-patterns.md`](docs/references/reference-openclaw-design-patterns.md) | Architecture, session/sandbox model, skill patterns, cron patterns, memory system, messaging, environment architecture, promotion workflow, **operational learnings** (§13), A2A principle, advanced patterns |
 | [`docs/references/reference-openclaw-prompt-caching.md`](docs/references/reference-openclaw-prompt-caching.md) | `cacheRetention` configuration for Anthropic prompt caching — the single biggest cost lever on chatty agents |
 | [`docs/references/`](docs/references/) *(other)* | DigitalOcean setup evaluation, order/CRM skill reference, Shopify/Gmail research, skill editing notes, WhatsApp injection defense, X API cost projection |
-| [`CLAUDE.md`](CLAUDE.md) | Dense reference of every config pattern and gotcha — the file Claude Code loads first when working in this repo |
+| [`CLAUDE.md`](CLAUDE.md) | Dense reference of every config pattern and gotcha. Claude Code auto-loads it; Codex users can symlink it as `AGENTS.md` or point at it explicitly in the prompt |
 
 ## Key concepts
 
