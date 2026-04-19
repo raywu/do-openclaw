@@ -13,7 +13,6 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **`prompt-claude-code-openclaw-setup.md`** — Generic Claude Code prompt for guided setup (mirrors the setup guide)
 
 **Other:**
-- **`prompt-multi-agent-openclaw-setup.md`** — **DEPRECATED (2026-04-19).** Use `prompt-claude-code-openclaw-setup.md` instead. File retained for link stability; do not add new content.
 - **`references/reference-openclaw-design-patterns.md`** — Architecture, session model, skill patterns, cron patterns, memory system, messaging patterns, environment architecture, promotion workflow, anti-patterns, CLI-to-API migration (auto-migrate), configuration patterns, operational learnings, A2A architecture
 - **`references/reference-openclaw-prompt-caching.md`** — Anthropic prompt caching configuration (`cacheRetention`)
 - **`references/reference-openclaw-digitalocean-setup-evaluation.md`** — Architecture evaluation: seven-layer architecture with dual specialization/security analysis
@@ -21,6 +20,7 @@ This is a documentation repository for the **OpenClaw** open-source, self-hosted
 - **`references/reference-openclaw-shopify-gmail-research-report.md`** — Shopify/Gmail integration research
 - **`references/reference-openclaw-skill-editing-report.md`** — Skill editing patterns
 - **`references/reference-whatsapp-injection-defense-analysis.md`** — WhatsApp injection defense analysis
+- **`references/reference-prompt-multi-agent-openclaw-setup.md`** — **DEPRECATED (2026-04-19, moved 2026-04-19).** Superseded by `prompt-claude-code-openclaw-setup.md`. Retained only for link stability; do not add new content.
 
 ## Key Config Patterns
 

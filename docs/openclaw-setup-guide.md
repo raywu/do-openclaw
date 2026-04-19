@@ -11,24 +11,26 @@ Deploy a Premium AMD Droplet (4 GB RAM / 2 vCPU, ~$24/mo) with Ubuntu 24.04. Sel
 
 **1.2 — Create a Non-Root Service User**
 
+> **Pick a username first.** Throughout this guide, `[NONROOT_USER]` is a placeholder for the non-root Linux user that will own and run the OpenClaw gateway on your droplet. Pick a name that makes sense for your deployment (e.g., `opclaw`, `agentuser`, or the operator's handle) and substitute it wherever you see `[NONROOT_USER]` below. The examples use plain lowercase; the name must be a valid Linux username (lowercase letters, digits, `-`/`_`, no spaces).
+
 > **CRITICAL: Order of operations matters.** Configure passwordless sudo and VERIFY it works BEFORE disabling root SSH. If you disable root login first and sudo doesn't work, you are locked out. Recovery requires: DigitalOcean dashboard → Access → Reset Root Password (reboots droplet) → Launch Recovery Console (VNC-based, bypasses SSH entirely) → fix sudoers. The web-based Droplet Console will NOT work because it uses SSH, which you just locked down.
 
 ```bash
 ssh root@YOUR_DROPLET_IP
-adduser clawuser
-usermod -aG sudo clawuser
+adduser [NONROOT_USER]
+usermod -aG sudo [NONROOT_USER]
 # Copy SSH authorized keys to the new user
-mkdir -p /home/clawuser/.ssh
-cp /root/.ssh/authorized_keys /home/clawuser/.ssh/
-chown -R clawuser:clawuser /home/clawuser/.ssh
-chmod 700 /home/clawuser/.ssh && chmod 600 /home/clawuser/.ssh/authorized_keys
+mkdir -p /home/[NONROOT_USER]/.ssh
+cp /root/.ssh/authorized_keys /home/[NONROOT_USER]/.ssh/
+chown -R [NONROOT_USER]:[NONROOT_USER] /home/[NONROOT_USER]/.ssh
+chmod 700 /home/[NONROOT_USER]/.ssh && chmod 600 /home/[NONROOT_USER]/.ssh/authorized_keys
 
-# Configure passwordless sudo for clawuser
-echo "clawuser ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/clawuser
-chmod 440 /etc/sudoers.d/clawuser
+# Configure passwordless sudo for [NONROOT_USER]
+echo "[NONROOT_USER] ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/[NONROOT_USER]
+chmod 440 /etc/sudoers.d/[NONROOT_USER]
 
-# VERIFY sudo works before proceeding (from a new SSH session as clawuser)
-# ssh clawuser@YOUR_DROPLET_IP "sudo -n whoami"
+# VERIFY sudo works before proceeding (from a new SSH session as [NONROOT_USER])
+# ssh [NONROOT_USER]@YOUR_DROPLET_IP "sudo -n whoami"
 # Must return "root". If not, DO NOT proceed to 1.3.
 ```
 
@@ -38,7 +40,7 @@ Edit `/etc/ssh/sshd_config`:
 ```
 PermitRootLogin no
 PasswordAuthentication no
-AllowUsers clawuser
+AllowUsers [NONROOT_USER]
 ```
 Then restart: `sudo systemctl restart sshd`
 
@@ -77,8 +79,8 @@ In the DigitalOcean dashboard, enable weekly Droplet snapshots (~$1–2/mo) as a
 Claude Code is Anthropic's terminal-based agentic coding CLI. Install it now — before OpenClaw — so it's available for creating workspace files, skills, and configuration in later phases. Claude Code and OpenClaw are fully isolated: OpenClaw cannot access, spawn, or interact with Claude Code.
 
 ```bash
-# As clawuser (not root):
-su - clawuser
+# As [NONROOT_USER] (not root):
+su - [NONROOT_USER]
 
 # Install via native installer (no Node.js dependency, self-contained binary)
 curl -fsSL https://claude.ai/install.sh | bash
@@ -142,10 +144,10 @@ node --version
 # Or let the install script handle it (it installs its own Node).
 ```
 
-Switch to `clawuser` and install:
+Switch to `[NONROOT_USER]` and install:
 
 ```bash
-su - clawuser
+su - [NONROOT_USER]
 
 # Option A (recommended): Install via npm
 npm install -g openclaw@latest
@@ -195,7 +197,7 @@ Verify binding: `ss -tlnp | grep 18789` — must show `127.0.0.1:18789`, not `0.
 
 From your local machine:
 ```bash
-ssh -L 18789:localhost:18789 clawuser@YOUR_DROPLET_IP
+ssh -L 18789:localhost:18789 [NONROOT_USER]@YOUR_DROPLET_IP
 ```
 Then open `http://localhost:18789` in your browser.
 
@@ -450,8 +452,8 @@ You are not a general-purpose assistant — stay within your domain.
 ### Exec (Restricted by Allowlist)
 > **If you skipped Phase 2.5 (Google Sheets):** Omit the gog entry below.
 
-- `/home/clawuser/.local/bin/gog` — Google Workspace operations
-- `/home/clawuser/scripts/safe-git.sh` — Git operations (add, commit, push, status, log, diff only)
+- `/home/[NONROOT_USER]/.local/bin/gog` — Google Workspace operations
+- `/home/[NONROOT_USER]/scripts/safe-git.sh` — Git operations (add, commit, push, status, log, diff only)
 - Additional entries per your exec-approvals.json allowlist
 
 ### Sandbox
@@ -873,7 +875,7 @@ Edit `~/.openclaw-dev/openclaw.json` — change these two settings:
 
 > **Why a separate state directory?** DEV uses a completely isolated `~/.openclaw-dev/` directory with its own config, workspace, and cron state. The `--dev` flag tells OpenClaw to use this directory and automatically assigns a separate port (19001) to prevent conflicts with the always-on PROD Gateway. Removing channels prevents DEV from accidentally responding to real users. Start DEV with: `openclaw start --dev`. Stop when done testing.
 >
-> **SSH tunnel for DEV dashboard:** `ssh -L 19001:localhost:19001 clawuser@YOUR_DROPLET_IP` → open `http://localhost:19001`.
+> **SSH tunnel for DEV dashboard:** `ssh -L 19001:localhost:19001 [NONROOT_USER]@YOUR_DROPLET_IP` → open `http://localhost:19001`.
 >
 > **Promotion scripts:** For production deployments with LOCAL/DEV/PROD environments, see `reference-openclaw-design-patterns.md` Section 9 for the full promotion workflow (`promote.sh`, `promote-dev.sh`, `promote-skill.sh`, `auto-promote.sh`, `rollback.sh`).
 >
@@ -904,7 +906,7 @@ Build the required Docker image:
 ```bash
 # Install Docker if not present
 sudo apt install -y docker.io
-sudo usermod -aG docker clawuser
+sudo usermod -aG docker [NONROOT_USER]
 
 # Build the OpenClaw sandbox image (use sg to run with docker group in current session)
 sg docker -c "cd ~/.openclaw && bash scripts/sandbox-setup.sh"
@@ -978,7 +980,7 @@ Create `~/.openclaw/exec-approvals.json`:
 {
   "version": 1,
   "socket": {
-    "path": "/home/clawuser/.openclaw/exec-approvals.sock",
+    "path": "/home/[NONROOT_USER]/.openclaw/exec-approvals.sock",
     "token": "${EXEC_APPROVALS_SOCKET_TOKEN}"
   },
   "defaults": {
@@ -995,10 +997,10 @@ Create `~/.openclaw/exec-approvals.json`:
       "autoAllowSkills": false,
       "allowlist": [
         {
-          "pattern": "/home/clawuser/.local/bin/gog"
+          "pattern": "/home/[NONROOT_USER]/.local/bin/gog"
         },
         {
-          "pattern": "/home/clawuser/scripts/safe-git.sh"
+          "pattern": "/home/[NONROOT_USER]/scripts/safe-git.sh"
         }
       ]
     }
@@ -1070,9 +1072,9 @@ EOF
 chmod 600 ~/.openclaw/.env
 ```
 
-> **Security:** The `.env` file has `chmod 600` — only `clawuser` can read it. Never commit it to git (it's in `.gitignore`). Never reference it in workspace files. The Gateway auto-loads it on startup.
+> **Security:** The `.env` file has `chmod 600` — only `[NONROOT_USER]` can read it. Never commit it to git (it's in `.gitignore`). Never reference it in workspace files. The Gateway auto-loads it on startup.
 
-> **Remote .env creation gotcha:** If creating `.env` on a remote droplet via SSH heredoc, do NOT use `$(command)` substitution — it evaluates on your local machine, not the droplet. Use explicit values instead. Example: `$(openssl rand -hex 32)` in a heredoc sent via SSH will generate the token locally and bake the result into the file, which works — but if the heredoc is quoted wrong, the variable expands to empty. Always verify `.env` values after writing remotely: `ssh clawuser@DROPLET "cat ~/.openclaw/.env | grep -c '=.\+'` (should match the number of entries).
+> **Remote .env creation gotcha:** If creating `.env` on a remote droplet via SSH heredoc, do NOT use `$(command)` substitution — it evaluates on your local machine, not the droplet. Use explicit values instead. Example: `$(openssl rand -hex 32)` in a heredoc sent via SSH will generate the token locally and bake the result into the file, which works — but if the heredoc is quoted wrong, the variable expands to empty. Always verify `.env` values after writing remotely: `ssh [NONROOT_USER]@DROPLET "cat ~/.openclaw/.env | grep -c '=.\+'` (should match the number of entries).
 
 > **Gateway and .env:** `openclaw gateway install` bakes `.env` values into the systemd service unit file at install time. After changing `.env` values: (1) export the new vars in your shell, (2) run `openclaw gateway install --force`, (3) `systemctl daemon-reload`, (4) restart the gateway. Without `--force` + `daemon-reload`, the gateway uses the old baked values.
 
@@ -1778,7 +1780,7 @@ openclaw sandbox explain
 **fnm path issues (node/npm not found in scripts or cron):**
 - SSH commands and cron scripts run in non-login shells where fnm is not loaded.
 - Fix: wrap commands with `bash -lc "<command>"` or prefix with `eval "$(~/.local/share/fnm/fnm env)"`.
-- Verify: `ssh clawuser@YOUR_DROPLET_IP "bash -lc 'node --version'"` — must return a version.
+- Verify: `ssh [NONROOT_USER]@YOUR_DROPLET_IP "bash -lc 'node --version'"` — must return a version.
 - For exec-approvals: include fnm-managed paths (`~/.local/share/fnm/node-versions/*/bin/node`) alongside standard paths (`/usr/bin/node`).
 
 **`sessions_send` from cron fails silently:**
